@@ -1,27 +1,63 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { KeyRound, ArrowLeft, BookOpen, AlertTriangle } from 'lucide-react';
-import { forgotPassword } from '../utils/api';
+import { KeyRound, ArrowLeft, BookOpen, AlertTriangle, Mail, CheckCircle2 } from 'lucide-react';
+import { requestPasswordReset, resetPasswordWithToken } from '../utils/api';
 import { AppFooter } from './AppFooter';
+
+type Screen = 'request' | 'reset' | 'success';
 
 export function ForgotPassword() {
   const navigate = useNavigate();
+  const [screen, setScreen] = useState<Screen>('request');
   const [studentId, setStudentId] = useState('');
   const [email, setEmail] = useState('');
+  const [resetToken, setResetToken] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
   const [loading, setLoading] = useState(false);
 
-  const handleSubmit = async (e: React.FormEvent) => {
+  const handleRequestReset = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
     setSuccess('');
     setLoading(true);
 
-    if (!studentId.trim() || !email.trim() || !newPassword) {
-      setError('Please fill in all fields');
+    if (!studentId.trim() || !email.trim()) {
+      setError('Please fill in both fields');
+      setLoading(false);
+      return;
+    }
+
+    const result = await requestPasswordReset({
+      student_id: studentId.trim(),
+      email: email.trim()
+    });
+
+    if (result.success) {
+      setScreen('reset');
+      setSuccess(result.message || 'If an account matches, a reset link has been sent.');
+    } else {
+      setError(result.error || 'Password reset request failed');
+    }
+    setLoading(false);
+  };
+
+  const handleResetPassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError('');
+    setSuccess('');
+    setLoading(true);
+
+    if (!resetToken.trim()) {
+      setError('Please enter the reset token');
+      setLoading(false);
+      return;
+    }
+
+    if (!newPassword) {
+      setError('Please enter a new password');
       setLoading(false);
       return;
     }
@@ -38,18 +74,14 @@ export function ForgotPassword() {
       return;
     }
 
-    const result = await forgotPassword({
-      student_id: studentId.trim(),
-      email: email.trim(),
+    const result = await resetPasswordWithToken({
+      reset_token: resetToken.trim(),
       new_password: newPassword
     });
 
     if (result.success) {
-      setSuccess(result.message || 'Password reset successful! You can now login.');
-      setStudentId('');
-      setEmail('');
-      setNewPassword('');
-      setConfirmPassword('');
+      setScreen('success');
+      setSuccess(result.message || 'Password reset successful!');
     } else {
       setError(result.error || 'Password reset failed');
     }
@@ -81,103 +113,169 @@ export function ForgotPassword() {
       <main className="flex-1 flex items-center justify-center px-4 py-8">
         <div className="max-w-md w-full">
           <div className="bg-gray-800 rounded-2xl shadow-2xl p-8 border border-gray-700">
-            <div className="text-center mb-8">
-              <div className="inline-flex items-center justify-center w-16 h-16 bg-yellow-500 rounded-full mb-4">
-                <KeyRound className="w-8 h-8 text-white" />
-              </div>
-              <h2 className="text-2xl font-bold text-white mb-2">Reset Password</h2>
-              <p className="text-gray-400">Verify with your UST Gmail to set a new password</p>
-            </div>
-
-            <form onSubmit={handleSubmit} className="space-y-6">
-              {error && (
-                <div className="bg-red-500/20 border border-red-500 text-red-400 px-4 py-3 rounded-lg text-sm flex items-start gap-2">
-                  <AlertTriangle className="w-5 h-5 mt-0.5 flex-shrink-0" />
-                  <span>{error}</span>
+            {screen === 'request' ? (
+              <>
+                <div className="text-center mb-8">
+                  <div className="inline-flex items-center justify-center w-16 h-16 bg-yellow-500 rounded-full mb-4">
+                    <Mail className="w-8 h-8 text-white" />
+                  </div>
+                  <h2 className="text-2xl font-bold text-white mb-2">Reset Password</h2>
+                  <p className="text-gray-400">
+                    Enter your Student ID and UST Gmail to request a password reset.
+                  </p>
                 </div>
-              )}
 
-              {success && (
-                <div className="bg-green-500/20 border border-green-500 text-green-400 px-4 py-3 rounded-lg text-sm">
-                  {success}
+                <form onSubmit={handleRequestReset} className="space-y-6">
+                  {error && (
+                    <div className="bg-red-500/20 border border-red-500 text-red-400 px-4 py-3 rounded-lg text-sm flex items-start gap-2">
+                      <AlertTriangle className="w-5 h-5 mt-0.5 flex-shrink-0" />
+                      <span>{error}</span>
+                    </div>
+                  )}
+
+                  {success && (
+                    <div className="bg-green-500/20 border border-green-500 text-green-400 px-4 py-3 rounded-lg text-sm">
+                      {success}
+                    </div>
+                  )}
+
+                  <div>
+                    <label className="block text-sm font-medium text-gray-300 mb-2">
+                      Student ID Number
+                    </label>
+                    <input
+                      type="text"
+                      value={studentId}
+                      onChange={(e) => setStudentId(e.target.value)}
+                      placeholder="Enter your student ID"
+                      className="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:outline-none focus:border-yellow-500 focus:ring-1 focus:ring-yellow-500"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium text-gray-300 mb-2">
+                      UST Gmail
+                    </label>
+                    <input
+                      type="email"
+                      value={email}
+                      onChange={(e) => setEmail(e.target.value)}
+                      placeholder="example@ust.edu.ph"
+                      className="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:outline-none focus:border-yellow-500 focus:ring-1 focus:ring-yellow-500"
+                    />
+                    <p className="mt-1 text-xs text-gray-400">
+                      Enter the UST Gmail currently on file for this account
+                    </p>
+                  </div>
+
+                  <button
+                    type="submit"
+                    disabled={loading}
+                    className="w-full bg-yellow-500 hover:bg-yellow-600 text-gray-900 font-bold py-3 px-4 rounded-lg shadow-lg transform transition-all duration-200 hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {loading ? 'Requesting Reset...' : 'Request Reset Link'}
+                  </button>
+                </form>
+              </>
+            ) : screen === 'reset' ? (
+              <>
+                <div className="text-center mb-8">
+                  <div className="inline-flex items-center justify-center w-16 h-16 bg-yellow-500 rounded-full mb-4">
+                    <KeyRound className="w-8 h-8 text-white" />
+                  </div>
+                  <h2 className="text-2xl font-bold text-white mb-2">Enter Reset Token</h2>
+                  <p className="text-gray-400">
+                    Enter the reset token you received and create a new password.
+                  </p>
                 </div>
-              )}
 
-              <div>
-                <label className="block text-sm font-medium text-gray-300 mb-2">
-                  Student ID Number
-                </label>
-                <input
-                  type="text"
-                  value={studentId}
-                  onChange={(e) => setStudentId(e.target.value)}
-                  placeholder="Enter your student ID"
-                  className="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:outline-none focus:border-yellow-500 focus:ring-1 focus:ring-yellow-500"
-                />
-              </div>
+                <form onSubmit={handleResetPassword} className="space-y-6">
+                  {error && (
+                    <div className="bg-red-500/20 border border-red-500 text-red-400 px-4 py-3 rounded-lg text-sm flex items-start gap-2">
+                      <AlertTriangle className="w-5 h-5 mt-0.5 flex-shrink-0" />
+                      <span>{error}</span>
+                    </div>
+                  )}
 
-              <div>
-                <label className="block text-sm font-medium text-gray-300 mb-2">
-                  UST Gmail
-                </label>
-                <input
-                  type="email"
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                  placeholder="example@ust.edu.ph"
-                  className="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:outline-none focus:border-yellow-500 focus:ring-1 focus:ring-yellow-500"
-                />
-                <p className="mt-1 text-xs text-gray-400">
-                  Enter the UST Gmail currently on file for this account
-                </p>
-              </div>
+                  {success && (
+                    <div className="bg-green-500/20 border border-green-500 text-green-400 px-4 py-3 rounded-lg text-sm">
+                      {success}
+                    </div>
+                  )}
 
-              <div>
-                <label className="block text-sm font-medium text-gray-300 mb-2">
-                  New Password
-                </label>
-                <input
-                  type="password"
-                  value={newPassword}
-                  onChange={(e) => setNewPassword(e.target.value)}
-                  placeholder="Create a new password"
-                  className="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:outline-none focus:border-yellow-500 focus:ring-1 focus:ring-yellow-500"
-                />
-              </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-300 mb-2">
+                      Reset Token
+                    </label>
+                    <input
+                      type="text"
+                      value={resetToken}
+                      onChange={(e) => setResetToken(e.target.value)}
+                      placeholder="Paste your reset token here"
+                      className="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:outline-none focus:border-yellow-500 focus:ring-1 focus:ring-yellow-500"
+                    />
+                    <p className="mt-1 text-xs text-gray-400">
+                      Token is single-use and expires after 1 hour
+                    </p>
+                  </div>
 
-              <div>
-                <label className="block text-sm font-medium text-gray-300 mb-2">
-                  Confirm New Password
-                </label>
-                <input
-                  type="password"
-                  value={confirmPassword}
-                  onChange={(e) => setConfirmPassword(e.target.value)}
-                  placeholder="Confirm your new password"
-                  className="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:outline-none focus:border-yellow-500 focus:ring-1 focus:ring-yellow-500"
-                />
-              </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-300 mb-2">
+                      New Password
+                    </label>
+                    <input
+                      type="password"
+                      value={newPassword}
+                      onChange={(e) => setNewPassword(e.target.value)}
+                      placeholder="Create a new password"
+                      className="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:outline-none focus:border-yellow-500 focus:ring-1 focus:ring-yellow-500"
+                    />
+                  </div>
 
-              <button
-                type="submit"
-                disabled={loading}
-                className="w-full bg-yellow-500 hover:bg-yellow-600 text-gray-900 font-bold py-3 px-4 rounded-lg shadow-lg transform transition-all duration-200 hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                {loading ? 'Resetting Password...' : 'Reset Password'}
-              </button>
-            </form>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-300 mb-2">
+                      Confirm New Password
+                    </label>
+                    <input
+                      type="password"
+                      value={confirmPassword}
+                      onChange={(e) => setConfirmPassword(e.target.value)}
+                      placeholder="Confirm your new password"
+                      className="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:outline-none focus:border-yellow-500 focus:ring-1 focus:ring-yellow-500"
+                    />
+                  </div>
 
-            <div className="mt-6 text-center">
-              <p className="text-gray-400 text-sm">
-                Remember your password?{' '}
-                <button
-                  onClick={() => navigate('/user/login')}
-                  className="text-yellow-400 hover:text-yellow-300 font-medium"
-                >
-                  Login here
-                </button>
-              </p>
-            </div>
+                  <button
+                    type="submit"
+                    disabled={loading}
+                    className="w-full bg-yellow-500 hover:bg-yellow-600 text-gray-900 font-bold py-3 px-4 rounded-lg shadow-lg transform transition-all duration-200 hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {loading ? 'Resetting Password...' : 'Reset Password'}
+                  </button>
+                </form>
+              </>
+            ) : (
+              <>
+                <div className="text-center">
+                  <div className="inline-flex items-center justify-center w-16 h-16 bg-green-500 rounded-full mb-4">
+                    <CheckCircle2 className="w-8 h-8 text-white" />
+                  </div>
+                  <h2 className="text-2xl font-bold text-white mb-2">Password Reset Complete</h2>
+                  <p className="text-gray-400">
+                    Your password has been reset successfully.
+                  </p>
+                </div>
+
+                <div className="mt-8 text-center">
+                  <button
+                    onClick={() => navigate('/user/login')}
+                    className="w-full bg-yellow-500 hover:bg-yellow-600 text-gray-900 font-bold py-3 px-4 rounded-lg shadow-lg transition-all duration-200 hover:scale-105"
+                  >
+                    Go to Login
+                  </button>
+                </div>
+              </>
+            )}
           </div>
         </div>
       </main>

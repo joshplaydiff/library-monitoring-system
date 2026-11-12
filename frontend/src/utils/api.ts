@@ -139,11 +139,15 @@ export async function getLogs(filters?: {
     if (filters?.page) queryParams.append('page', filters.page.toString());
 
     const url = `${BASE_URL}/logs${queryParams.toString() ? '?' + queryParams.toString() : ''}`;
-    
-    const response = await fetch(url);
+
+    const token = localStorage.getItem('userToken');
+    const headers: Record<string, string> = {};
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+
+    const response = await fetch(url, { headers });
 
     const result = await safeJsonParse(response);
-    
+
     if (!response.ok) {
       throw new Error(result.error || 'Failed to fetch logs');
     }
@@ -151,9 +155,9 @@ export async function getLogs(filters?: {
     return { success: true, data: result.data || result };
   } catch (error) {
     console.error('Error fetching logs:', error);
-    return { 
-      success: false, 
-      error: error instanceof Error ? error.message : 'Unknown error' 
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Unknown error'
     };
   }
 }
@@ -186,10 +190,14 @@ export async function getAnalytics(period: 'day' | 'week' | 'month' = 'week', se
 // Get active users currently in the library
 export async function getActiveUsers(): Promise<ApiResponse<any[]>> {
   try {
-    const response = await fetch(`${BASE_URL}/logs/active-users`);
+    const token = localStorage.getItem('userToken');
+    const headers: Record<string, string> = {};
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+
+    const response = await fetch(`${BASE_URL}/logs/active-users`, { headers });
 
     const data = await safeJsonParse(response);
-    
+
     if (!response.ok) {
       throw new Error(data.error || 'Failed to fetch active users');
     }
@@ -199,9 +207,9 @@ export async function getActiveUsers(): Promise<ApiResponse<any[]>> {
     return { success: true, data: Array.isArray(users) ? users : [] };
   } catch (error) {
     console.error('Error fetching active users:', error);
-    return { 
-      success: false, 
-      error: error instanceof Error ? error.message : 'Unknown error' 
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Unknown error'
     };
   }
 }
@@ -209,24 +217,29 @@ export async function getActiveUsers(): Promise<ApiResponse<any[]>> {
 // Check if a specific visitor has an active session
 export async function checkVisitorActiveSession(visitorId: string): Promise<ApiResponse<any>> {
   try {
-    const response = await fetch(`${BASE_URL}/logs/active-session?visitorId=${encodeURIComponent(visitorId)}`);
+    const token = localStorage.getItem('userToken');
+    const headers: Record<string, string> = {};
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+
+    const response = await fetch(`${BASE_URL}/logs/active-session?visitorId=${encodeURIComponent(visitorId)}`, { headers });
 
     const data = await safeJsonParse(response);
-    
+
     if (!response.ok) {
       throw new Error(data.error || 'Failed to check active session');
     }
 
-    return { 
-      success: true, 
+    return {
+      success: true,
       active: data.active,
-      data: data.data 
+      data: data.data
     };
   } catch (error) {
     console.error('Error checking active session:', error);
-    return { 
-      success: false, 
-      error: error instanceof Error ? error.message : 'Unknown error' 
+    return {
+      success: false,
+      active: false,
+      error: error instanceof Error ? error.message : 'Unknown error'
     };
   }
 }
@@ -234,10 +247,14 @@ export async function checkVisitorActiveSession(visitorId: string): Promise<ApiR
 // Check if a specific user is currently active
 export async function checkUserActive(userId: string): Promise<ApiResponse<any>> {
   try {
-    const response = await fetch(`${BASE_URL}/logs/active-session?visitorId=${encodeURIComponent(userId)}`);
+    const token = localStorage.getItem('userToken');
+    const headers: Record<string, string> = {};
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+
+    const response = await fetch(`${BASE_URL}/logs/active-session?visitorId=${encodeURIComponent(userId)}`, { headers });
 
     const data = await safeJsonParse(response);
-    
+
     if (!response.ok) {
       throw new Error(data.error || 'Failed to check user status');
     }
@@ -245,9 +262,9 @@ export async function checkUserActive(userId: string): Promise<ApiResponse<any>>
     return { success: true, data: data.data || null };
   } catch (error) {
     console.error('Error checking user status:', error);
-    return { 
-      success: false, 
-      error: error instanceof Error ? error.message : 'Unknown error' 
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Unknown error'
     };
   }
 }
@@ -255,7 +272,7 @@ export async function checkUserActive(userId: string): Promise<ApiResponse<any>>
 // Manual logout for a user
 export async function manualLogout(userId: string): Promise<ApiResponse<any>> {
   try {
-    const token = localStorage.getItem('authToken');
+    const token = localStorage.getItem('userToken');
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
     };
@@ -270,7 +287,7 @@ export async function manualLogout(userId: string): Promise<ApiResponse<any>> {
     });
 
     const data = await safeJsonParse(response);
-    
+
     if (!response.ok) {
       throw new Error(data.error || 'Failed to logout user');
     }
@@ -278,9 +295,9 @@ export async function manualLogout(userId: string): Promise<ApiResponse<any>> {
     return { success: true, data: data.data, message: data.message };
   } catch (error) {
     console.error('Error logging out user:', error);
-    return { 
-      success: false, 
-      error: error instanceof Error ? error.message : 'Unknown error' 
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Unknown error'
     };
   }
 }
@@ -336,7 +353,45 @@ export async function loginUser(data: { student_id: string; password: string }):
   }
 }
 
-// Forgot password - reset using UST Gmail verification
+// Password reset - request a reset token (no new_password sent)
+export async function requestPasswordReset(data: { student_id: string; email: string }): Promise<ApiResponse<any>> {
+  try {
+    const response = await fetch(`${BASE_URL}/auth/forgot-password`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data)
+    });
+    const result = await safeJsonParse(response);
+    if (!response.ok) {
+      throw new Error(result.error || 'Failed to request password reset');
+    }
+    return { success: true, data: result.data, message: result.message };
+  } catch (error) {
+    console.error('Error requesting password reset:', error);
+    return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+  }
+}
+
+// Password reset - consume a valid token and set new password
+export async function resetPasswordWithToken(data: { reset_token: string; new_password: string }): Promise<ApiResponse<any>> {
+  try {
+    const response = await fetch(`${BASE_URL}/auth/reset-password`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data)
+    });
+    const result = await safeJsonParse(response);
+    if (!response.ok) {
+      throw new Error(result.error || 'Failed to reset password');
+    }
+    return { success: true, data: result.data, message: result.message };
+  } catch (error) {
+    console.error('Error resetting password with token:', error);
+    return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+  }
+}
+
+// Forgot password - legacy endpoint (kept for reference; use requestPasswordReset instead)
 export async function forgotPassword(data: { student_id: string; email: string; new_password: string }): Promise<ApiResponse<any>> {
   try {
     const response = await fetch(`${BASE_URL}/auth/forgot-password`, {

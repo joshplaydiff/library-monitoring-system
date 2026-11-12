@@ -97,10 +97,24 @@ export function QRScanScreen({ isOnline }: QRScanScreenProps) {
         return;
       }
 
-      // Check active session using resolved user_id or official_id
+      // Check active session using resolved user_id or official_id.
+      // A failed lookup is NOT treated as an inactive session — it's an error.
       const sessionLookupId = resolvedUserId !== undefined ? String(resolvedUserId) : officialId;
       const sessionResult = await checkVisitorActiveSession(sessionLookupId);
-      const hasActiveSession = sessionResult.success && sessionResult.active;
+
+      if (!sessionResult.success) {
+        // Session lookup failed — do not guess entry/exit
+        setScanStatus('error');
+        setMessage(sessionResult.error || 'Unable to verify session. Please try again.');
+        lastScannedValue.current = null;
+        lastScanTime.current = 0;
+        pendingScan.current = null;
+        setProcessing(false);
+        setShowScanner(true);
+        return;
+      }
+
+      const hasActiveSession = sessionResult.active === true;
       const logType: 'entry' | 'exit' = hasActiveSession ? 'exit' : 'entry';
 
       const logResult = await submitLog({
@@ -147,8 +161,7 @@ export function QRScanScreen({ isOnline }: QRScanScreenProps) {
   const handleError = (error: any) => {
     console.error('QR Scanner error:', error);
     setScanStatus('error');
-    
-    // Provide user-friendly error messages based on error type
+
     let errorMessage = 'Camera access denied or scanner error';
     if (error?.name === 'NotFoundError' || error?.message?.includes('Requested device not found')) {
       errorMessage = 'No camera detected. Please ensure a camera is connected and try again.';
@@ -157,7 +170,7 @@ export function QRScanScreen({ isOnline }: QRScanScreenProps) {
     } else if (error?.name === 'NotReadableError' || error?.message?.includes('Device not readable')) {
       errorMessage = 'Camera is being used by another application. Please close other apps using the camera.';
     }
-    
+
     setMessage(errorMessage);
     setShowScanner(false);
   };
@@ -169,6 +182,7 @@ export function QRScanScreen({ isOnline }: QRScanScreenProps) {
     setProcessing(false);
     lastScannedValue.current = null;
     lastScanTime.current = 0;
+    pendingScan.current = null;
   };
 
   const handleManualEntry = () => {

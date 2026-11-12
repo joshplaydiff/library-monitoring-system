@@ -1,10 +1,21 @@
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 
+const crypto = require('crypto');
+
 const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET) {
   console.warn('WARNING: JWT_SECRET is not set. Set JWT_SECRET in your environment.');
 }
+
+/**
+ * Compute a SHA-256 digest suitable for indexed equality lookup of tokens.
+ * Use bcrypt for account passwords; use SHA-256 for short-lived tokens
+ * where indexed lookup is needed and bcrypt's cost is unnecessary.
+ */
+const sha256Digest = (value) => {
+  return crypto.createHash('sha256').update(value).digest('hex');
+};
 
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
@@ -99,6 +110,7 @@ module.exports = {
   optionalAuth,
   hashPassword,
   comparePassword,
+  sha256Digest,
   generateToken,
   JWT_SECRET
 };
