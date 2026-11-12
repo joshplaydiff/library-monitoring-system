@@ -8,6 +8,7 @@ const { generateToken, hashPassword, comparePassword, sha256Digest, JWT_SECRET, 
 
 const loginRateLimit = new Map();
 const activationRateLimit = new Map();
+const resetTokenRateLimit = new Map();
 
 const checkRateLimit = (identifier) => {
   const now = Date.now();
@@ -508,6 +509,89 @@ router.post('/activate-token', authenticateToken, requireRole('librarian', 'admi
     res.status(500).json({
       success: false,
       error: 'Failed to generate activation token',
+      message: error.message
+    });
+  }
+});
+
+/**
+ * Librarian-only: Issue a password-reset token for a patron after identity verification.
+ * The token is stored as a SHA-256 digest and is single-use with 1-hour expiration.
+ * The librarian communicates the token to the patron out-of-band.
+ * Does NOT confirm email delivery — email is not configured.
+ */
+router.post('/reset-password-token', authenticateToken, requireRole('librarian', 'administrator'), async (req, res) => {
+  try {
+    const rateLimit = checkRateLimit(`reset-token:${req.ip}`);
+    if (!rateLimit.allowed) {
+      return res.status(429).json({
+        success: false,
+        error: 'Too many reset token requests. Please try again later.',
+        retryAfter: rateLimit.retryAfter
+      });
+    }
+
+    const { user_id } = req.body;
+
+    if (!user_id) {
+      return res.status(400).json({
+        success: false,
+        error: 'User ID is required'
+      });
+    }
+
+    const [users] = await promisePool.query(
+      'SELECT id, full_name, id_classification, role, is_password_set FROM users WHERE id = ?',
+      [user_id]
+    );
+
+    if (users.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'User not found'
+      });
+    }
+
+    const user = users[0];
+
+    // Only patron accounts can be reset
+    if (user.role !== 'patron') {
+      return res.status(400).json({
+        success: false,
+        error: 'Only patron accounts can be reset'
+      });
+    }
+
+    // Generate a secure reset token
+    const resetToken = require('crypto').randomBytes(32).toString('hex');
+    // Store SHA-256 digest for indexed lookup
+    const resetTokenDigest = sha256Digest(resetToken);
+    const resetExpires = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+
+    await promisePool.query(
+      'UPDATE users SET reset_token = ?, reset_expires = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+      [resetTokenDigest, resetExpires, user_id]
+    );
+
+    // Return the token exactly once to the authenticated issuing librarian
+    // for controlled handoff. Do NOT log the token.
+    res.json({
+      success: true,
+      message: 'Password reset token generated. Provide this token to the patron through a secure channel.',
+      data: {
+        user_id: user.id,
+        full_name: user.full_name,
+        id_classification: user.id_classification,
+        reset_token: resetToken,
+        expires_in_hours: 1,
+        note: 'This token is shown only once. Copy it now. The patron uses it at the password-reset screen.'
+      }
+    });
+  } catch (error) {
+    console.error('Reset token generation error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to generate reset token',
       message: error.message
     });
   }

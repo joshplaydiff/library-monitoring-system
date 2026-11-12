@@ -255,7 +255,7 @@ router.get('/', authenticateToken, async (req, res) => {
   }
 });
 
-router.get('/analytics', async (req, res) => {
+router.get('/analytics', authenticateToken, async (req, res) => {
   try {
     const { period = 'week', section, room_id } = req.query;
 
@@ -445,7 +445,7 @@ router.post('/logout/:userId', authenticateToken, async (req, res) => {
   }
 });
 
-router.get('/analytics/historical', async (req, res) => {
+router.get('/analytics/historical', authenticateToken, async (req, res) => {
   try {
     const { comparisonType, referenceDate } = req.query;
 
@@ -473,7 +473,7 @@ router.get('/analytics/historical', async (req, res) => {
   }
 });
 
-router.get('/analytics/trends', async (req, res) => {
+router.get('/analytics/trends', authenticateToken, async (req, res) => {
   try {
     const { period, count, referenceDate } = req.query;
 
@@ -501,7 +501,7 @@ router.get('/analytics/trends', async (req, res) => {
   }
 });
 
-router.get('/analytics/capacity', async (req, res) => {
+router.get('/analytics/capacity', authenticateToken, async (req, res) => {
   try {
     const { period = 'month' } = req.query;
 
@@ -522,7 +522,7 @@ router.get('/analytics/capacity', async (req, res) => {
   }
 });
 
-router.get('/analytics/engagement', async (req, res) => {
+router.get('/analytics/engagement', authenticateToken, async (req, res) => {
   try {
     const { minVisits = 2, daysBack = 30 } = req.query;
 
@@ -596,9 +596,10 @@ router.get('/resolve-user', authenticateToken, async (req, res) => {
 
 /**
  * Server-authoritative QR attendance scan.
- * Resolves patron from official_id + id_type, checks active session,
- * records entry or exit, and returns the result with server-generated timestamp.
- * Idempotent via client_event_id.
+ * Resolves patron from official_id + id_type, checks active session within a
+ * transaction using SELECT ... FOR UPDATE row locking, records entry or exit,
+ * and returns the result with server-generated timestamp.
+ * Idempotent via client_event_id UNIQUE constraint.
  */
 router.post('/scan',
   authenticateToken,
@@ -629,7 +630,6 @@ router.post('/scan',
       room_id
     } = req.body;
 
-    const requestingUserId = req.user?.id;
     const requestingUserRole = req.user?.role;
 
     // Only librarian/administrator can scan attendance for patrons
@@ -640,118 +640,164 @@ router.post('/scan',
       });
     }
 
+    let connection;
     try {
-      // Idempotency: check if this client_event_id was already processed
-      const [existing] = await promisePool.query(
-        'SELECT id, user_id, log_type, timestamp, section, room_id FROM visit_logs WHERE client_event_id = ?',
-        [client_event_id]
-      );
+      connection = await promisePool.getConnection();
+      await connection.beginTransaction();
 
-      if (existing.length > 0) {
-        return res.status(200).json({
-          success: true,
-          data: {
-            id: existing[0].id,
-            user_id: existing[0].user_id,
-            log_type: existing[0].log_type,
-            timestamp: existing[0].timestamp,
-            section: existing[0].section,
-            room_id: existing[0].room_id,
-            idempotent: true
-          },
-          message: 'Attendance event already recorded.'
-        });
-      }
-
-      // Resolve patron from official_id + id_classification
-      const [users] = await promisePool.query(
-        'SELECT id, student_id, official_id, id_classification, role, full_name, email, user_type, department FROM users WHERE official_id = ? AND id_classification = ?',
-        [official_id, id_type]
-      );
-
-      if (users.length === 0) {
-        return res.status(404).json({
-          success: false,
-          error: 'Patron not found. Please register first.'
-        });
-      }
-
-      const patron = users[0];
-      const resolvedUserId = patron.id;
-
-      // Check active session: most recent entry without a subsequent exit
-      const [latestEntry] = await promisePool.query(
-        `SELECT id, timestamp FROM visit_logs
-         WHERE user_id = ? AND log_type = 'entry'
-         ORDER BY timestamp DESC, id DESC
-         LIMIT 1`,
-        [resolvedUserId]
-      );
-
-      let logType = 'entry';
-      let entryTimestamp = null;
-
-      if (latestEntry.length > 0) {
-        entryTimestamp = latestEntry[0].timestamp;
-
-        // Check if there's a subsequent exit
-        const [subsequentExit] = await promisePool.query(
-          `SELECT id FROM visit_logs
-           WHERE user_id = ? AND log_type = 'exit' AND timestamp > ?
-           ORDER BY timestamp ASC, id ASC
-           LIMIT 1`,
-          [resolvedUserId, entryTimestamp]
+      try {
+        // Idempotency: check if this client_event_id was already processed
+        const [existing] = await connection.query(
+          'SELECT id, user_id, log_type, timestamp, section, room_id FROM visit_logs WHERE client_event_id = ?',
+          [client_event_id]
         );
 
-        if (subsequentExit.length === 0) {
-          // Active session exists → this scan is an exit
-          logType = 'exit';
+        if (existing.length > 0) {
+          await connection.rollback();
+          return res.status(200).json({
+            success: true,
+            data: {
+              id: existing[0].id,
+              user_id: existing[0].user_id,
+              log_type: existing[0].log_type,
+              timestamp: existing[0].timestamp,
+              section: existing[0].section,
+              room_id: existing[0].room_id,
+              idempotent: true
+            },
+            message: 'Attendance event already recorded.'
+          });
         }
+
+        // Resolve and lock the patron row to prevent concurrent duplicate sessions
+        const [users] = await connection.query(
+          'SELECT id, student_id, official_id, id_classification, role, full_name, email, user_type, department FROM users WHERE official_id = ? AND id_classification = ? FOR UPDATE',
+          [official_id, id_type]
+        );
+
+        if (users.length === 0) {
+          await connection.rollback();
+          return res.status(404).json({
+            success: false,
+            error: 'Patron not found. Please register first.'
+          });
+        }
+
+        const patron = users[0];
+        const resolvedUserId = patron.id;
+
+        // Check active session: most recent entry without a subsequent exit
+        const [latestEntry] = await connection.query(
+          `SELECT id, timestamp FROM visit_logs
+           WHERE user_id = ? AND log_type = 'entry'
+           ORDER BY timestamp DESC, id DESC
+           LIMIT 1`,
+          [resolvedUserId]
+        );
+
+        let logType = 'entry';
+
+        if (latestEntry.length > 0) {
+          const entryTimestamp = latestEntry[0].timestamp;
+
+          // Check if there's a subsequent exit after this entry
+          const [subsequentExit] = await connection.query(
+            `SELECT id FROM visit_logs
+             WHERE user_id = ? AND log_type = 'exit' AND timestamp > ?
+             ORDER BY timestamp ASC, id ASC
+             LIMIT 1`,
+            [resolvedUserId, entryTimestamp]
+          );
+
+          if (subsequentExit.length === 0) {
+            // Active session exists → this scan is an exit
+            logType = 'exit';
+          }
+        }
+
+        // Insert the attendance record with server-generated timestamp
+        const [result] = await connection.query(
+          `INSERT INTO visit_logs
+             (user_id, user_type, name, purpose, section, room_id, log_type, timestamp, client_event_id, synced)
+           VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), ?, 1)`,
+          [
+            resolvedUserId,
+            patron.user_type,
+            patron.full_name,
+            purpose || 'General',
+            section || 'Main Library',
+            room_id || null,
+            logType,
+            client_event_id
+          ]
+        );
+
+        await connection.commit();
+
+        const [newLog] = await connection.query(
+          'SELECT id, user_id, user_type, name, purpose, section, room_id, log_type, timestamp, client_event_id FROM visit_logs WHERE id = ?',
+          [result.insertId]
+        );
+
+        broadcastNewLog(newLog[0]);
+
+        return res.status(201).json({
+          success: true,
+          data: {
+            id: newLog[0].id,
+            user_id: newLog[0].user_id,
+            official_id: patron.official_id,
+            id_type: patron.id_classification,
+            name: newLog[0].name,
+            user_type: newLog[0].user_type,
+            purpose: newLog[0].purpose,
+            section: newLog[0].section,
+            room_id: newLog[0].room_id,
+            log_type: newLog[0].log_type,
+            timestamp: newLog[0].timestamp,
+            client_event_id: newLog[0].client_event_id,
+            idempotent: false
+          },
+          message: `Attendance recorded as ${logType}.`
+        });
+      } catch (error) {
+        // Handle duplicate key conflict from UNIQUE constraint on client_event_id
+        if (error.code === 'ER_DUP_ENTRY' && error.message.includes('client_event_id')) {
+          // Another request already committed this event_id — retrieve it
+          const [existing] = await connection.query(
+            'SELECT id, user_id, log_type, timestamp, section, room_id FROM visit_logs WHERE client_event_id = ?',
+            [client_event_id]
+          );
+
+          await connection.rollback();
+          if (existing.length > 0) {
+            return res.status(200).json({
+              success: true,
+              data: {
+                id: existing[0].id,
+                user_id: existing[0].user_id,
+                log_type: existing[0].log_type,
+                timestamp: existing[0].timestamp,
+                section: existing[0].section,
+                room_id: existing[0].room_id,
+                idempotent: true
+              },
+              message: 'Attendance event already recorded.'
+            });
+          }
+          return res.status(200).json({
+            success: true,
+            data: null,
+            idempotent: true,
+            message: 'Attendance event already recorded.'
+          });
+        }
+
+        if (connection) {
+          await connection.rollback();
+        }
+        throw error;
       }
-
-      // Insert the attendance record with server-generated timestamp
-      const [result] = await promisePool.query(
-        `INSERT INTO visit_logs
-           (user_id, user_type, name, purpose, section, room_id, log_type, timestamp, client_event_id, synced)
-         VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), ?, 1)`,
-        [
-          resolvedUserId,
-          patron.user_type,
-          patron.full_name,
-          purpose || 'General',
-          section || 'Main Library',
-          room_id || null,
-          logType,
-          client_event_id
-        ]
-      );
-
-      const [newLog] = await promisePool.query(
-        'SELECT id, user_id, user_type, name, purpose, section, room_id, log_type, timestamp, client_event_id FROM visit_logs WHERE id = ?',
-        [result.insertId]
-      );
-
-      broadcastNewLog(newLog[0]);
-
-      return res.status(201).json({
-        success: true,
-        data: {
-          id: newLog[0].id,
-          user_id: newLog[0].user_id,
-          official_id: patron.official_id,
-          id_type: patron.id_classification,
-          name: newLog[0].name,
-          user_type: newLog[0].user_type,
-          purpose: newLog[0].purpose,
-          section: newLog[0].section,
-          room_id: newLog[0].room_id,
-          log_type: newLog[0].log_type,
-          timestamp: newLog[0].timestamp,
-          client_event_id: newLog[0].client_event_id,
-          idempotent: false
-        },
-        message: `Attendance recorded as ${logType}.`
-      });
     } catch (error) {
       console.error('Error scanning attendance:', error);
       return res.status(500).json({
@@ -759,6 +805,10 @@ router.post('/scan',
         error: 'Failed to record attendance',
         message: error.message
       });
+    } finally {
+      if (connection) {
+        connection.release();
+      }
     }
   }
 );

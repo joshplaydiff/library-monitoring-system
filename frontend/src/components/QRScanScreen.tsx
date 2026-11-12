@@ -1,6 +1,6 @@
 import React, { useState, useRef, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { QrCode, ArrowLeft, CheckCircle, XCircle, Wifi, WifiOff, RefreshCw, User, Clock, MapPin, FileText } from 'lucide-react';
+import { QrCode, ArrowLeft, CheckCircle, XCircle, Wifi, WifiOff, RefreshCw, User, Clock, MapPin, FileText, Menu, Plus } from 'lucide-react';
 import { Scanner } from '@yudiel/react-qr-scanner';
 import { AppFooter } from './AppFooter';
 import { scanAttendance } from '../utils/api';
@@ -25,6 +25,22 @@ interface ScanResult {
   idempotent: boolean;
 }
 
+const PURPOSES = [
+  { value: 'General', label: 'General Visit' },
+  { value: 'Study', label: 'Study / Research' },
+  { value: 'Borrowing Books', label: 'Borrowing Books' },
+  { value: 'Computer Use', label: 'Computer Use' },
+  { value: 'Group Discussion', label: 'Group Discussion' },
+  { value: 'Meeting', label: 'Meeting' },
+  { value: 'Other', label: 'Other' }
+];
+
+const SECTIONS = [
+  { value: 'Main Library', label: 'Main Library' },
+  { value: 'Learning Commons', label: 'Learning Commons' },
+  { value: 'Meeting Room', label: 'Meeting Room' }
+];
+
 export function QRScanScreen({ isOnline }: QRScanScreenProps) {
   const navigate = useNavigate();
   const [scanStatus, setScanStatus] = useState<'scanning' | 'success' | 'error' | null>('scanning');
@@ -32,6 +48,8 @@ export function QRScanScreen({ isOnline }: QRScanScreenProps) {
   const [showScanner, setShowScanner] = useState(true);
   const [processing, setProcessing] = useState(false);
   const [scanResult, setScanResult] = useState<ScanResult | null>(null);
+  const [selectedPurpose, setSelectedPurpose] = useState('General');
+  const [selectedSection, setSelectedSection] = useState('Main Library');
   const lastScannedValue = useRef<string | null>(null);
   const lastScanTime = useRef<number>(0);
   const pendingScan = useRef<{ rawValue: string; timestamp: number; clientEventId: string } | null>(null);
@@ -111,8 +129,8 @@ export function QRScanScreen({ isOnline }: QRScanScreenProps) {
         client_event_id: pendingScan.current.clientEventId,
         official_id: officialId,
         id_type: idType,
-        purpose: 'General',
-        section: 'Main Library',
+        purpose: selectedPurpose,
+        section: selectedSection,
         room_id: null
       });
 
@@ -223,6 +241,44 @@ export function QRScanScreen({ isOnline }: QRScanScreenProps) {
             <p className="text-sm sm:text-base text-gray-400 px-2">
               Scan patron QR code to record entry or exit
             </p>
+          </div>
+
+          {/* Visit Configuration */}
+          <div className="bg-gray-800 rounded-xl p-4 border border-gray-700">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
+              <div>
+                <label className="block text-xs font-medium text-gray-400 mb-1 uppercase tracking-wider">
+                  Purpose of Visit
+                </label>
+                <select
+                  value={selectedPurpose}
+                  onChange={(e) => setSelectedPurpose(e.target.value)}
+                  className="w-full bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-yellow-500"
+                >
+                  {PURPOSES.map((p) => (
+                    <option key={p.value} value={p.value}>
+                      {p.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-gray-400 mb-1 uppercase tracking-wider">
+                  Library Section
+                </label>
+                <select
+                  value={selectedSection}
+                  onChange={(e) => setSelectedSection(e.target.value)}
+                  className="w-full bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-yellow-500"
+                >
+                  {SECTIONS.map((s) => (
+                    <option key={s.value} value={s.value}>
+                      {s.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
           </div>
 
           {/* Scanner Frame */}

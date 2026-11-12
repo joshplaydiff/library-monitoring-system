@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { query, validationResult } = require('express-validator');
 const { promisePool } = require('../config/database');
+const { authenticateToken } = require('../middleware/auth');
 
 const getAnalytics = async (req, res) => {
   try {
@@ -129,10 +130,10 @@ const getEngagementAnalytics = async (req, res) => {
   }
 };
 
-router.get('/analytics', getAnalytics);
-router.get('/analytics/historical', getHistoricalAnalytics);
-router.get('/analytics/trends', getTrendAnalytics);
-router.get('/analytics/capacity', getCapacityAnalytics);
-router.get('/analytics/engagement', getEngagementAnalytics);
+router.get('/analytics', authenticateToken, getAnalytics);
+router.get('/analytics/historical', authenticateToken, getHistoricalAnalytics);
+router.get('/analytics/trends', authenticateToken, getTrendAnalytics);
+router.get('/analytics/capacity', authenticateToken, getCapacityAnalytics);
+router.get('/analytics/engagement', authenticateToken, getEngagementAnalytics);
 
 module.exports = router;
