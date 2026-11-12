@@ -16,7 +16,7 @@ const validateLog = [
   body('room_id').optional().isInt()
 ];
 
-router.post('/', optionalAuth, validateLog, async (req, res) => {
+router.post('/', authenticateToken, validateLog, async (req, res) => {
   try {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
@@ -26,19 +26,52 @@ router.post('/', optionalAuth, validateLog, async (req, res) => {
       });
     }
 
-    const { name, purpose, log_type, user_type, user_id, student_id, section, room_id } = req.body;
+    const { name, purpose, log_type, user_type, user_id, student_id, official_id, id_classification, section, room_id } = req.body;
+    const requestingUserId = req.user?.id;
+    const requestingUserRole = req.user?.role;
 
     let resolvedUserId = user_id ? Number(user_id) : null;
 
-    if (!resolvedUserId && student_id) {
-      const [users] = await promisePool.query(
-        'SELECT id FROM users WHERE student_id = ?',
-        [student_id]
-      );
-
-      if (users.length > 0) {
-        resolvedUserId = users[0].id;
+    // Librarian/administrator can create attendance for any patron
+    if (requestingUserRole === 'librarian' || requestingUserRole === 'administrator') {
+      if (official_id && id_classification) {
+        // Classification-aware resolution: official_id + id_classification
+        const [users] = await promisePool.query(
+          'SELECT id FROM users WHERE official_id = ? AND id_classification = ?',
+          [official_id, id_classification]
+        );
+        if (users.length > 0) {
+          resolvedUserId = users[0].id;
+        } else if (student_id) {
+          const [usersByStudentId] = await promisePool.query(
+            'SELECT id FROM users WHERE student_id = ?',
+            [student_id]
+          );
+          if (usersByStudentId.length > 0) {
+            resolvedUserId = usersByStudentId[0].id;
+          }
+        }
+      } else if (student_id) {
+        const [users] = await promisePool.query(
+          'SELECT id FROM users WHERE student_id = ?',
+          [student_id]
+        );
+        if (users.length > 0) {
+          resolvedUserId = users[0].id;
+        }
       }
+      // If no user resolved and no user_id provided, allow walk-in (resolvedUserId stays null)
+    }
+    // Patron can only create attendance for themselves
+    else if (requestingUserRole === 'patron') {
+      resolvedUserId = requestingUserId;
+    }
+    // Unknown role — deny
+    else {
+      return res.status(403).json({
+        success: false,
+        error: 'Access denied. Insufficient permissions to record attendance.'
+      });
     }
 
     const [result] = await promisePool.query(
@@ -70,12 +103,25 @@ router.post('/', optionalAuth, validateLog, async (req, res) => {
 router.post('/sync', authenticateToken, async (req, res) => {
   try {
     const { logs } = req.body;
+    const requestingUserId = req.user?.id;
+    const requestingUserRole = req.user?.role;
 
     if (!Array.isArray(logs)) {
       return res.status(400).json({
         success: false,
         error: 'Logs must be an array'
       });
+    }
+
+    // Patrons can only sync their own logs
+    if (requestingUserRole === 'patron') {
+      const patronLogs = logs.filter((log) => log.user_id && Number(log.user_id) === requestingUserId);
+      if (patronLogs.length !== logs.length) {
+        return res.status(403).json({
+          success: false,
+          error: 'Access denied. Patrons can only sync their own attendance records.'
+        });
+      }
     }
 
     const syncedLogs = [];
@@ -105,12 +151,20 @@ router.post('/sync', authenticateToken, async (req, res) => {
   }
 });
 
-router.get('/', async (req, res) => {
+router.get('/', authenticateToken, async (req, res) => {
   try {
     const { user_type, purpose, startDate, endDate, limit, page } = req.query;
+    const requestingUserId = req.user?.id;
+    const requestingUserRole = req.user?.role;
 
     let query = 'SELECT * FROM visit_logs WHERE 1=1';
     const params = [];
+
+    // Patrons can only see their own attendance records
+    if (requestingUserRole === 'patron') {
+      query += ' AND user_id = ?';
+      params.push(requestingUserId);
+    }
 
     if (user_type) {
       query += ' AND user_type = ?';
@@ -149,14 +203,35 @@ router.get('/', async (req, res) => {
 
     let total = logs.length;
     if (limit && !page) {
-      const [countResult] = await promisePool.query(
-        'SELECT COUNT(*) as total FROM visit_logs WHERE 1=1' +
-        (user_type ? ' AND user_type = ?' : '') +
-        (purpose ? ' AND purpose LIKE ?' : '') +
-        (startDate ? ' AND timestamp >= ?' : '') +
-        (endDate ? ' AND timestamp <= ?' : ''),
-        [user_type, purpose ? `%${purpose}%` : null, startDate, endDate].filter(Boolean)
-      );
+      let countQuery = 'SELECT COUNT(*) as total FROM visit_logs WHERE 1=1';
+      const countParams = [];
+
+      if (requestingUserRole === 'patron') {
+        countQuery += ' AND user_id = ?';
+        countParams.push(requestingUserId);
+      }
+
+      if (user_type) {
+        countQuery += ' AND user_type = ?';
+        countParams.push(user_type);
+      }
+
+      if (purpose) {
+        countQuery += ' AND purpose LIKE ?';
+        countParams.push(`%${purpose}%`);
+      }
+
+      if (startDate) {
+        countQuery += ' AND timestamp >= ?';
+        countParams.push(startDate);
+      }
+
+      if (endDate) {
+        countQuery += ' AND timestamp <= ?';
+        countParams.push(endDate);
+      }
+
+      const [countResult] = await promisePool.query(countQuery, countParams);
       total = countResult[0]?.total || 0;
     }
 
@@ -208,7 +283,7 @@ router.get('/analytics', async (req, res) => {
   }
 });
 
-router.get('/active-users', async (req, res) => {
+router.get('/active-users', authenticateToken, async (req, res) => {
   try {
     const [activeUsers] = await promisePool.query(`
       SELECT vl.user_id, vl.name, vl.user_type, vl.purpose, vl.timestamp
@@ -246,7 +321,7 @@ router.get('/active-users', async (req, res) => {
   }
 });
 
-router.get('/active-session', async (req, res) => {
+router.get('/active-session', authenticateToken, async (req, res) => {
   try {
     const { visitorId } = req.query;
 
@@ -319,6 +394,16 @@ router.get('/active-session', async (req, res) => {
 router.post('/logout/:userId', authenticateToken, async (req, res) => {
   try {
     const { userId } = req.params;
+    const requestingUserId = req.user?.id;
+    const requestingUserRole = req.user?.role;
+
+    // Patrons can only log themselves out
+    if (requestingUserRole === 'patron' && String(requestingUserId) !== String(userId)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Access denied. You can only log out your own attendance session.'
+      });
+    }
 
     const [activeEntry] = await promisePool.query(`
       SELECT * FROM visit_logs
@@ -462,7 +547,7 @@ router.get('/analytics/engagement', async (req, res) => {
  * Resolve a patron by official_id and id_type (classification).
  * Used by QR scanner to look up patron data from a static QR code.
  */
-router.get('/resolve-user', async (req, res) => {
+router.get('/resolve-user', authenticateToken, async (req, res) => {
   try {
     const { official_id, id_type } = req.query;
 

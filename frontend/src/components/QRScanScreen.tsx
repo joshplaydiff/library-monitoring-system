@@ -17,22 +17,28 @@ export function QRScanScreen({ isOnline }: QRScanScreenProps) {
   const [processing, setProcessing] = useState(false);
   const lastScannedValue = useRef<string | null>(null);
   const lastScanTime = useRef<number>(0);
+  const pendingScan = useRef<{ rawValue: string; timestamp: number } | null>(null);
 
   const handleScan = async (detectedCodes: any[]) => {
+    // Prevent processing while a scan is already in flight
     if (processing) return;
     if (!detectedCodes || detectedCodes.length === 0) return;
 
     const { rawValue } = detectedCodes[0];
     const now = Date.now();
 
+    // Single debounce check: ignore re-scans of the same code within 3 seconds
     if (lastScannedValue.current === rawValue && now - lastScanTime.current < 3000) {
       return;
     }
 
+    // Record this scan attempt immediately to prevent duplicate processing
     lastScannedValue.current = rawValue;
     lastScanTime.current = now;
+
     setProcessing(true);
     setShowScanner(false);
+    pendingScan.current = { rawValue, timestamp: now };
 
     try {
       let idType = 'student';
@@ -46,7 +52,7 @@ export function QRScanScreen({ isOnline }: QRScanScreenProps) {
         // Static QR payload: { id_type, official_id }
         if (qrData.id_type && qrData.official_id) {
           idType = String(qrData.id_type);
-          officialId = String(qrData.official_id);
+          officialId = String(qrData.official_id).trim(); // preserve leading zeros as string
 
           // Look up patron by official_id + id_type
           const resolveResult = await resolveUserByOfficialId(officialId, idType);
@@ -56,30 +62,40 @@ export function QRScanScreen({ isOnline }: QRScanScreenProps) {
             patronName = user.name || 'Unknown';
             patronUserType = user.user_type || 'student';
           } else {
+            // Reject unknown identifiers
             setScanStatus('error');
             setMessage('Patron not found. Please register first.');
             setProcessing(false);
             setShowScanner(true);
+            lastScannedValue.current = null;
+            lastScanTime.current = 0;
+            pendingScan.current = null;
             return;
           }
         } else {
-          // Fallback: treat raw value as official_id
-          officialId = rawValue;
+          // Malformed QR — missing required fields
+          setScanStatus('error');
+          setMessage('Invalid QR code. Please use a valid patron QR code.');
+          setProcessing(false);
+          setShowScanner(true);
+          lastScannedValue.current = null;
+          lastScanTime.current = 0;
+          pendingScan.current = null;
+          return;
         }
       } catch {
         // Not JSON — treat raw value as official_id with default student type
-        officialId = rawValue;
+        officialId = rawValue.trim();
       }
 
-      const now = Date.now();
-      if (lastScannedValue.current === rawValue && now - lastScanTime.current < 3000) {
+      // Verify this is still the pending scan (prevent race conditions from rapid scanner events)
+      if (
+        !pendingScan.current ||
+        pendingScan.current.rawValue !== rawValue ||
+        pendingScan.current.timestamp !== now
+      ) {
         return;
       }
-
-      lastScannedValue.current = rawValue;
-      lastScanTime.current = now;
-      setProcessing(true);
-      setShowScanner(false);
 
       // Check active session using resolved user_id or official_id
       const sessionLookupId = resolvedUserId !== undefined ? String(resolvedUserId) : officialId;
@@ -96,18 +112,35 @@ export function QRScanScreen({ isOnline }: QRScanScreenProps) {
         log_type: logType
       });
 
+      // Clear the pending scan marker
+      pendingScan.current = null;
+
       if (logResult.success) {
         setScanStatus('success');
         setMessage(`${logType === 'entry' ? 'Entry' : 'Exit'} Success! Welcome${logType === 'exit' ? ' back' : ''}.`);
       } else {
+        // If the server did not confirm persistence, do not show success
         setScanStatus('error');
-        setMessage(logResult.error || 'Failed to record attendance');
+        setMessage(logResult.error || 'Failed to record attendance. Please try again.');
+        // Reset debounce on failure so the user can retry
+        lastScannedValue.current = null;
+        lastScanTime.current = 0;
+        setProcessing(false);
+        setShowScanner(true);
       }
     } catch (error) {
+      pendingScan.current = null;
       setScanStatus('error');
       setMessage('Failed to process QR code');
-    } finally {
+      // Reset debounce on failure so the user can retry
+      lastScannedValue.current = null;
+      lastScanTime.current = 0;
       setProcessing(false);
+      setShowScanner(true);
+    } finally {
+      if (!pendingScan.current) {
+        setProcessing(false);
+      }
     }
   };
 

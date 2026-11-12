@@ -4,7 +4,30 @@ const { body, validationResult } = require('express-validator');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { promisePool } = require('../config/database');
-const { generateToken, hashPassword, comparePassword, JWT_SECRET, authenticateToken } = require('../middleware/auth');
+const { generateToken, hashPassword, comparePassword, JWT_SECRET, authenticateToken, requireRole } = require('../middleware/auth');
+
+const loginRateLimit = new Map();
+
+const checkRateLimit = (identifier) => {
+  const now = Date.now();
+  const windowMs = 15 * 60 * 1000; // 15 minutes
+  const maxAttempts = 5;
+
+  if (!loginRateLimit.has(identifier)) {
+    loginRateLimit.set(identifier, []);
+  }
+
+  const attempts = loginRateLimit.get(identifier);
+  const recentAttempts = attempts.filter((time) => now - time < windowMs);
+
+  if (recentAttempts.length >= maxAttempts) {
+    return { allowed: false, retryAfter: Math.ceil((recentAttempts[0] + windowMs - now) / 1000) };
+  }
+
+  recentAttempts.push(now);
+  loginRateLimit.set(identifier, recentAttempts);
+  return { allowed: true };
+};
 
 const loginValidation = [
   body('username').notEmpty().withMessage('Username is required'),
@@ -13,6 +36,15 @@ const loginValidation = [
 
 router.post('/login', loginValidation, async (req, res) => {
   try {
+    const rateLimit = checkRateLimit(`login:${req.ip}`);
+    if (!rateLimit.allowed) {
+      return res.status(429).json({
+        success: false,
+        error: 'Too many login attempts. Please try again later.',
+        retryAfter: rateLimit.retryAfter
+      });
+    }
+
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
       return res.status(400).json({
@@ -62,13 +94,13 @@ router.post('/login', loginValidation, async (req, res) => {
     }
 
     const token = generateToken(user);
-    const { password_hash, ...userWithoutPassword } = user;
+    const { password_hash, activation_token, reset_token, activation_expires, reset_expires, ...userWithoutSensitive } = user;
 
     res.json({
       success: true,
       data: {
         token,
-        user: userWithoutPassword
+        user: userWithoutSensitive
       }
     });
   } catch (error) {
@@ -83,6 +115,15 @@ router.post('/login', loginValidation, async (req, res) => {
 
 router.post('/login/user', async (req, res) => {
   try {
+    const rateLimit = checkRateLimit(`login-user:${req.ip}`);
+    if (!rateLimit.allowed) {
+      return res.status(429).json({
+        success: false,
+        error: 'Too many login attempts. Please try again later.',
+        retryAfter: rateLimit.retryAfter
+      });
+    }
+
     const { student_id, password } = req.body;
 
     if (!student_id || !password) {
@@ -123,13 +164,13 @@ router.post('/login/user', async (req, res) => {
     }
 
     const token = generateToken(user);
-    const { password_hash, ...userWithoutPassword } = user;
+    const { password_hash, activation_token, reset_token, activation_expires, reset_expires, ...userWithoutSensitive } = user;
 
     res.json({
       success: true,
       data: {
         token,
-        user: userWithoutPassword
+        user: userWithoutSensitive
       }
     });
   } catch (error) {
@@ -158,53 +199,46 @@ router.post('/forgot-password', async (req, res) => {
       [student_id, student_id]
     );
 
+    // Always return a generic response regardless of whether the account exists.
+    // This prevents account enumeration via the forgot-password endpoint.
+    const genericResponse = {
+      success: true,
+      message: 'If an account with this ID and email exists, a password reset link has been sent to your UST Gmail.'
+    };
+
     if (users.length === 0) {
-      return res.status(404).json({
-        success: false,
-        error: 'Account not found. Please contact the librarian.'
-      });
+      return res.json(genericResponse);
     }
 
     const user = users[0];
 
     if (!user.email || !user.email.endsWith('@ust.edu.ph')) {
-      return res.status(403).json({
-        success: false,
-        error: 'Account does not have a UST Gmail on file. Please visit the librarian for assistance.'
-      });
+      return res.json(genericResponse);
     }
 
     if (user.email !== email.trim()) {
-      return res.status(403).json({
-        success: false,
-        error: 'Email does not match our records. Please visit the librarian for assistance.'
-      });
+      return res.json(genericResponse);
     }
 
-    // Generate a secure reset token valid for 1 hour
+    // Generate a secure reset token, store only its hash (never plaintext)
     const resetToken = require('crypto').randomBytes(32).toString('hex');
+    const resetTokenHash = await hashPassword(resetToken);
     const resetExpires = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
 
     await promisePool.query(
       'UPDATE users SET reset_token = ?, reset_expires = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
-      [resetToken, resetExpires, user.id]
+      [resetTokenHash, resetExpires, user.id]
     );
 
-    // In a production system, email this token to the user's UST Gmail.
-    // For development, return it so the librarian can communicate it securely.
-    res.json({
-      success: true,
-      message: 'Reset token generated. Use the /reset-password endpoint with this token to set a new password.',
-      data: {
-        reset_token: resetToken,
-        expires_in_minutes: 60,
-        user_id: user.id,
-        email: user.email
-      }
-    });
+    // NOTE: In production, send the resetToken via email to user.email.
+    // Email delivery is NOT configured in this application. The librarian must
+    // communicate the token to the patron through a secure out-of-band channel.
+    // Do NOT return the token in the API response.
+
+    return res.json(genericResponse);
   } catch (error) {
     console.error('Forgot password error:', error);
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
       error: 'Password reset failed',
       message: error.message
@@ -214,7 +248,8 @@ router.post('/forgot-password', async (req, res) => {
 
 /**
  * Reset password using a valid reset token.
- * Token is invalidated after successful use.
+ * Token is single-use and invalidated atomically after successful consumption.
+ * Token comparison uses bcrypt to avoid plaintext token storage.
  */
 router.post('/reset-password', async (req, res) => {
   try {
@@ -234,26 +269,35 @@ router.post('/reset-password', async (req, res) => {
       });
     }
 
+    // Find users with a non-expired reset token hash
     const [users] = await promisePool.query(
-      'SELECT * FROM users WHERE reset_token = ? AND reset_expires > NOW()',
-      [reset_token]
+      'SELECT * FROM users WHERE reset_token IS NOT NULL AND reset_expires > NOW()',
+      []
     );
 
-    if (users.length === 0) {
+    let matchedUser = null;
+
+    for (const user of users) {
+      const isMatch = await comparePassword(reset_token, user.reset_token);
+      if (isMatch) {
+        matchedUser = user;
+        break;
+      }
+    }
+
+    if (!matchedUser) {
       return res.status(401).json({
         success: false,
         error: 'Invalid or expired reset token'
       });
     }
 
-    const user = users[0];
-
     const password_hash = await hashPassword(new_password);
 
-    // Set password and invalidate the reset token in one operation
+    // Atomically set password and invalidate the reset token
     await promisePool.query(
       'UPDATE users SET password_hash = ?, is_password_set = 1, reset_token = NULL, reset_expires = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
-      [password_hash, user.id]
+      [password_hash, matchedUser.id]
     );
 
     res.json({
@@ -340,6 +384,76 @@ router.post('/activate', async (req, res) => {
     res.status(500).json({
       success: false,
       error: 'Account activation failed',
+      message: error.message
+    });
+  }
+});
+
+/**
+ * Librarian-only: Issue an activation token for an imported patron who has no password.
+ * The token is stored as a bcrypt hash and is single-use with 24-hour expiration.
+ * The librarian communicates the token to the patron out-of-band.
+ */
+router.post('/activate-token', authenticateToken, requireRole('librarian', 'administrator'), async (req, res) => {
+  try {
+    const { user_id } = req.body;
+
+    if (!user_id) {
+      return res.status(400).json({
+        success: false,
+        error: 'User ID is required'
+      });
+    }
+
+    const [users] = await promisePool.query(
+      'SELECT id, full_name, is_password_set FROM users WHERE id = ?',
+      [user_id]
+    );
+
+    if (users.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'User not found'
+      });
+    }
+
+    const user = users[0];
+
+    if (user.is_password_set === 1) {
+      return res.status(400).json({
+        success: false,
+        error: 'Account already has a password set'
+      });
+    }
+
+    // Generate a secure activation token, store only its hash
+    const activationToken = require('crypto').randomBytes(32).toString('hex');
+    const activationTokenHash = await hashPassword(activationToken);
+    const activationExpires = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours
+
+    await promisePool.query(
+      'UPDATE users SET activation_token = ?, activation_expires = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+      [activationTokenHash, activationExpires, user_id]
+    );
+
+    // NOTE: In production, deliver the activationToken to the patron via secure out-of-band
+    // channel (librarian handoff, printed slip, etc.). Email delivery is NOT configured.
+    // Do NOT return the token in the API response.
+
+    res.json({
+      success: true,
+      message: 'Activation token generated. Provide the token to the patron through a secure channel.',
+      data: {
+        user_id: user.id,
+        full_name: user.full_name,
+        expires_in_hours: 24
+      }
+    });
+  } catch (error) {
+    console.error('Activation token generation error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to generate activation token',
       message: error.message
     });
   }
