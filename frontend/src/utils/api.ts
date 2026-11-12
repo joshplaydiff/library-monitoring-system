@@ -269,6 +269,38 @@ export async function checkUserActive(userId: string): Promise<ApiResponse<any>>
   }
 }
 
+// Scan attendance - server-authoritative QR scan
+export async function scanAttendance(data: {
+  client_event_id: string;
+  official_id: string;
+  id_type: string;
+  purpose?: string;
+  section?: string;
+  room_id?: number;
+}): Promise<ApiResponse<any>> {
+  try {
+    const token = localStorage.getItem('userToken');
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+
+    const response = await fetch(`${BASE_URL}/logs/scan`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(data)
+    });
+    const data = await safeJsonParse(response);
+    if (!response.ok) {
+      throw new Error(data.error || 'Failed to scan attendance');
+    }
+    return { success: true, data: data.data, message: data.message };
+  } catch (error) {
+    console.error('Error scanning attendance:', error);
+    return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+  }
+}
+
 // Manual logout for a user
 export async function manualLogout(userId: string): Promise<ApiResponse<any>> {
   try {
@@ -295,14 +327,9 @@ export async function manualLogout(userId: string): Promise<ApiResponse<any>> {
     return { success: true, data: data.data, message: data.message };
   } catch (error) {
     console.error('Error logging out user:', error);
-    return {
-      success: false,
-      error: error instanceof Error ? error.message : 'Unknown error'
-    };
+    return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
   }
 }
-
-// Get single user by ID
 export async function getUserById(userId: string): Promise<ApiResponse<any>> {
   try {
     const response = await fetch(`${BASE_URL}/registered-users/${userId}`);

@@ -230,14 +230,14 @@ router.post('/forgot-password', async (req, res) => {
       return res.json(genericResponse);
     }
 
-    // Generate a secure reset token, store only its hash (never plaintext)
+    // Generate a secure reset token, store SHA-256 digest for indexed lookup
     const resetToken = require('crypto').randomBytes(32).toString('hex');
-    const resetTokenHash = await hashPassword(resetToken);
+    const resetTokenDigest = sha256Digest(resetToken);
     const resetExpires = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
 
     await promisePool.query(
       'UPDATE users SET reset_token = ?, reset_expires = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
-      [resetTokenHash, resetExpires, user.id]
+      [resetTokenDigest, resetExpires, user.id]
     );
 
     // NOTE: In production, send the resetToken via email to user.email.

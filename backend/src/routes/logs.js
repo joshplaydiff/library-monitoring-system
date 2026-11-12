@@ -3,7 +3,7 @@ const router = express.Router();
 const { body, query, validationResult } = require('express-validator');
 const { promisePool } = require('../config/database');
 const { broadcastNewLog, broadcastAnalyticsUpdate } = require('../utils/socketManager');
-const { authenticateToken, optionalAuth } = require('../middleware/auth');
+const { authenticateToken, optionalAuth, requireRole } = require('../middleware/auth');
 
 const validateLog = [
   body('name').notEmpty().withMessage('Name is required'),
@@ -593,5 +593,174 @@ router.get('/resolve-user', authenticateToken, async (req, res) => {
     });
   }
 });
+
+/**
+ * Server-authoritative QR attendance scan.
+ * Resolves patron from official_id + id_type, checks active session,
+ * records entry or exit, and returns the result with server-generated timestamp.
+ * Idempotent via client_event_id.
+ */
+router.post('/scan',
+  authenticateToken,
+  requireRole('librarian', 'administrator'),
+  [
+    body('client_event_id').notEmpty().withMessage('client_event_id is required'),
+    body('official_id').notEmpty().withMessage('official_id is required'),
+    body('id_type').isIn(['student', 'faculty', 'support_staff']).withMessage('id_type must be student, faculty, or support_staff'),
+    body('purpose').optional().notEmpty().withMessage('purpose is required if provided'),
+    body('section').optional().isIn(['Main Library', 'Learning Commons', 'Meeting Room']),
+    body('room_id').optional().isInt()
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        error: errors.array()[0].msg
+      });
+    }
+
+    const {
+      client_event_id,
+      official_id,
+      id_type,
+      purpose,
+      section,
+      room_id
+    } = req.body;
+
+    const requestingUserId = req.user?.id;
+    const requestingUserRole = req.user?.role;
+
+    // Only librarian/administrator can scan attendance for patrons
+    if (requestingUserRole !== 'librarian' && requestingUserRole !== 'administrator') {
+      return res.status(403).json({
+        success: false,
+        error: 'Access denied. Librarian or administrator account required.'
+      });
+    }
+
+    try {
+      // Idempotency: check if this client_event_id was already processed
+      const [existing] = await promisePool.query(
+        'SELECT id, user_id, log_type, timestamp, section, room_id FROM visit_logs WHERE client_event_id = ?',
+        [client_event_id]
+      );
+
+      if (existing.length > 0) {
+        return res.status(200).json({
+          success: true,
+          data: {
+            id: existing[0].id,
+            user_id: existing[0].user_id,
+            log_type: existing[0].log_type,
+            timestamp: existing[0].timestamp,
+            section: existing[0].section,
+            room_id: existing[0].room_id,
+            idempotent: true
+          },
+          message: 'Attendance event already recorded.'
+        });
+      }
+
+      // Resolve patron from official_id + id_classification
+      const [users] = await promisePool.query(
+        'SELECT id, student_id, official_id, id_classification, role, full_name, email, user_type, department FROM users WHERE official_id = ? AND id_classification = ?',
+        [official_id, id_type]
+      );
+
+      if (users.length === 0) {
+        return res.status(404).json({
+          success: false,
+          error: 'Patron not found. Please register first.'
+        });
+      }
+
+      const patron = users[0];
+      const resolvedUserId = patron.id;
+
+      // Check active session: most recent entry without a subsequent exit
+      const [latestEntry] = await promisePool.query(
+        `SELECT id, timestamp FROM visit_logs
+         WHERE user_id = ? AND log_type = 'entry'
+         ORDER BY timestamp DESC, id DESC
+         LIMIT 1`,
+        [resolvedUserId]
+      );
+
+      let logType = 'entry';
+      let entryTimestamp = null;
+
+      if (latestEntry.length > 0) {
+        entryTimestamp = latestEntry[0].timestamp;
+
+        // Check if there's a subsequent exit
+        const [subsequentExit] = await promisePool.query(
+          `SELECT id FROM visit_logs
+           WHERE user_id = ? AND log_type = 'exit' AND timestamp > ?
+           ORDER BY timestamp ASC, id ASC
+           LIMIT 1`,
+          [resolvedUserId, entryTimestamp]
+        );
+
+        if (subsequentExit.length === 0) {
+          // Active session exists → this scan is an exit
+          logType = 'exit';
+        }
+      }
+
+      // Insert the attendance record with server-generated timestamp
+      const [result] = await promisePool.query(
+        `INSERT INTO visit_logs
+           (user_id, user_type, name, purpose, section, room_id, log_type, timestamp, client_event_id, synced)
+         VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), ?, 1)`,
+        [
+          resolvedUserId,
+          patron.user_type,
+          patron.full_name,
+          purpose || 'General',
+          section || 'Main Library',
+          room_id || null,
+          logType,
+          client_event_id
+        ]
+      );
+
+      const [newLog] = await promisePool.query(
+        'SELECT id, user_id, user_type, name, purpose, section, room_id, log_type, timestamp, client_event_id FROM visit_logs WHERE id = ?',
+        [result.insertId]
+      );
+
+      broadcastNewLog(newLog[0]);
+
+      return res.status(201).json({
+        success: true,
+        data: {
+          id: newLog[0].id,
+          user_id: newLog[0].user_id,
+          official_id: patron.official_id,
+          id_type: patron.id_classification,
+          name: newLog[0].name,
+          user_type: newLog[0].user_type,
+          purpose: newLog[0].purpose,
+          section: newLog[0].section,
+          room_id: newLog[0].room_id,
+          log_type: newLog[0].log_type,
+          timestamp: newLog[0].timestamp,
+          client_event_id: newLog[0].client_event_id,
+          idempotent: false
+        },
+        message: `Attendance recorded as ${logType}.`
+      });
+    } catch (error) {
+      console.error('Error scanning attendance:', error);
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to record attendance',
+        message: error.message
+      });
+    }
+  }
+);
 
 module.exports = router;

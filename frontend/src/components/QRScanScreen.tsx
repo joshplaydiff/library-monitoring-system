@@ -1,12 +1,28 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { QrCode, ArrowLeft, CheckCircle, XCircle, Wifi, WifiOff, RefreshCw } from 'lucide-react';
+import { QrCode, ArrowLeft, CheckCircle, XCircle, Wifi, WifiOff, RefreshCw, User, Clock, MapPin, FileText } from 'lucide-react';
 import { Scanner } from '@yudiel/react-qr-scanner';
 import { AppFooter } from './AppFooter';
-import { checkVisitorActiveSession, submitLog, resolveUserByOfficialId } from '../utils/api';
+import { scanAttendance } from '../utils/api';
 
 interface QRScanScreenProps {
   isOnline: boolean;
+}
+
+interface ScanResult {
+  id: number;
+  user_id: number | null;
+  official_id: string | null;
+  id_type: string | null;
+  name: string;
+  user_type: string;
+  purpose: string;
+  section: string | null;
+  room_id: number | null;
+  log_type: 'entry' | 'exit';
+  timestamp: string;
+  client_event_id: string | null;
+  idempotent: boolean;
 }
 
 export function QRScanScreen({ isOnline }: QRScanScreenProps) {
@@ -15,9 +31,15 @@ export function QRScanScreen({ isOnline }: QRScanScreenProps) {
   const [message, setMessage] = useState('');
   const [showScanner, setShowScanner] = useState(true);
   const [processing, setProcessing] = useState(false);
+  const [scanResult, setScanResult] = useState<ScanResult | null>(null);
   const lastScannedValue = useRef<string | null>(null);
   const lastScanTime = useRef<number>(0);
-  const pendingScan = useRef<{ rawValue: string; timestamp: number } | null>(null);
+  const pendingScan = useRef<{ rawValue: string; timestamp: number; clientEventId: string } | null>(null);
+
+  // Generate a unique client event id for idempotent scan deduplication
+  const generateClientEventId = useCallback(() => {
+    return 'evt_' + Date.now() + '_' + Math.random().toString(36).substring(2, 11);
+  }, []);
 
   const handleScan = async (detectedCodes: any[]) => {
     // Prevent processing while a scan is already in flight
@@ -38,40 +60,19 @@ export function QRScanScreen({ isOnline }: QRScanScreenProps) {
 
     setProcessing(true);
     setShowScanner(false);
-    pendingScan.current = { rawValue, timestamp: now };
+    pendingScan.current = { rawValue, timestamp: now, clientEventId: generateClientEventId() };
 
     try {
       let idType = 'student';
       let officialId = rawValue;
-      let patronName = 'Unknown';
-      let patronUserType = 'student';
-      let resolvedUserId: number | undefined;
 
+      // Parse the QR payload
       try {
         const qrData = JSON.parse(rawValue);
         // Static QR payload: { id_type, official_id }
         if (qrData.id_type && qrData.official_id) {
           idType = String(qrData.id_type);
           officialId = String(qrData.official_id).trim(); // preserve leading zeros as string
-
-          // Look up patron by official_id + id_type
-          const resolveResult = await resolveUserByOfficialId(officialId, idType);
-          if (resolveResult.success && resolveResult.data) {
-            const user = resolveResult.data;
-            resolvedUserId = user.user_id;
-            patronName = user.name || 'Unknown';
-            patronUserType = user.user_type || 'student';
-          } else {
-            // Reject unknown identifiers
-            setScanStatus('error');
-            setMessage('Patron not found. Please register first.');
-            setProcessing(false);
-            setShowScanner(true);
-            lastScannedValue.current = null;
-            lastScanTime.current = 0;
-            pendingScan.current = null;
-            return;
-          }
         } else {
           // Malformed QR — missing required fields
           setScanStatus('error');
@@ -84,11 +85,18 @@ export function QRScanScreen({ isOnline }: QRScanScreenProps) {
           return;
         }
       } catch {
-        // Not JSON — treat raw value as official_id with default student type
-        officialId = rawValue.trim();
+        // Not JSON — reject as we need structured data
+        setScanStatus('error');
+        setMessage('Invalid QR code format. Please use a valid patron QR code.');
+        setProcessing(false);
+        setShowScanner(true);
+        lastScannedValue.current = null;
+        lastScanTime.current = 0;
+        pendingScan.current = null;
+        return;
       }
 
-      // Verify this is still the pending scan (prevent race conditions from rapid scanner events)
+      // Verify this is still the pending scan (prevent race conditions)
       if (
         !pendingScan.current ||
         pendingScan.current.rawValue !== rawValue ||
@@ -97,45 +105,31 @@ export function QRScanScreen({ isOnline }: QRScanScreenProps) {
         return;
       }
 
-      // Check active session using resolved user_id or official_id.
-      // A failed lookup is NOT treated as an inactive session — it's an error.
-      const sessionLookupId = resolvedUserId !== undefined ? String(resolvedUserId) : officialId;
-      const sessionResult = await checkVisitorActiveSession(sessionLookupId);
-
-      if (!sessionResult.success) {
-        // Session lookup failed — do not guess entry/exit
-        setScanStatus('error');
-        setMessage(sessionResult.error || 'Unable to verify session. Please try again.');
-        lastScannedValue.current = null;
-        lastScanTime.current = 0;
-        pendingScan.current = null;
-        setProcessing(false);
-        setShowScanner(true);
-        return;
-      }
-
-      const hasActiveSession = sessionResult.active === true;
-      const logType: 'entry' | 'exit' = hasActiveSession ? 'exit' : 'entry';
-
-      const logResult = await submitLog({
-        user_id: resolvedUserId,
-        student_id: officialId,
-        name: patronName,
-        user_type: patronUserType,
+      // Call server-authoritative scan endpoint
+      // The backend resolves the patron, checks session state, and records entry/exit
+      const scanResult = await scanAttendance({
+        client_event_id: pendingScan.current.clientEventId,
+        official_id: officialId,
+        id_type: idType,
         purpose: 'General',
-        log_type: logType
+        section: 'Main Library',
+        room_id: null
       });
 
       // Clear the pending scan marker
       pendingScan.current = null;
 
-      if (logResult.success) {
+      if (scanResult.success && scanResult.data) {
+        const data = scanResult.data as ScanResult;
+        setScanResult(data);
         setScanStatus('success');
-        setMessage(`${logType === 'entry' ? 'Entry' : 'Exit'} Success! Welcome${logType === 'exit' ? ' back' : ''}.`);
+
+        const action = data.log_type === 'entry' ? 'Time-in' : 'Time-out';
+        setMessage(`${action} recorded for ${data.name} (${data.official_id})`);
       } else {
-        // If the server did not confirm persistence, do not show success
+        // Server did not confirm persistence — do not show success
         setScanStatus('error');
-        setMessage(logResult.error || 'Failed to record attendance. Please try again.');
+        setMessage(scanResult.error || 'Failed to record attendance. Please try again.');
         // Reset debounce on failure so the user can retry
         lastScannedValue.current = null;
         lastScanTime.current = 0;
@@ -180,6 +174,7 @@ export function QRScanScreen({ isOnline }: QRScanScreenProps) {
     setMessage('');
     setShowScanner(true);
     setProcessing(false);
+    setScanResult(null);
     lastScannedValue.current = null;
     lastScanTime.current = 0;
     pendingScan.current = null;
@@ -226,7 +221,7 @@ export function QRScanScreen({ isOnline }: QRScanScreenProps) {
           <div className="text-center">
             <h2 className="text-xl sm:text-2xl font-bold text-white mb-2">Library Entry / Exit Scanner</h2>
             <p className="text-sm sm:text-base text-gray-400 px-2">
-              Scan visitor or student QR code to log entry or exit
+              Scan patron QR code to record entry or exit
             </p>
           </div>
 
@@ -256,19 +251,54 @@ export function QRScanScreen({ isOnline }: QRScanScreenProps) {
                 />
               )}
 
-              {/* Success State */}
-              {!showScanner && scanStatus === 'success' && (
-                <div className="absolute inset-0 flex flex-col items-center justify-center bg-green-900 bg-opacity-20">
-                  <CheckCircle className="w-16 h-16 sm:w-20 sm:h-20 text-green-400 mb-3 sm:mb-4" />
-                  <p className="text-green-400 font-semibold text-base sm:text-lg text-center px-2">{message}</p>
+              {/* Success State — Scan Result Details */}
+              {!showScanner && scanStatus === 'success' && scanResult && (
+                <div className="absolute inset-0 flex flex-col items-center justify-center bg-green-900 bg-opacity-20 p-4">
+                  <CheckCircle className="w-16 h-16 sm:w-20 sm:h-20 text-green-400 mb-4" />
+                  <div className="bg-white/10 backdrop-blur-sm rounded-xl p-6 border border-white/20 w-full max-w-sm">
+                    <div className="flex items-center gap-3 mb-3">
+                      <User className="w-5 h-5 text-green-400" />
+                      <span className="text-white font-medium">{scanResult.name}</span>
+                    </div>
+                    <div className="text-xs text-green-300 mb-1">Official UST ID</div>
+                    <div className="text-sm text-white font-mono mb-3">{scanResult.official_id}</div>
+                    <div className="flex items-center gap-3 mb-3">
+                      <FileText className="w-5 h-5 text-green-400" />
+                      <span className="text-sm text-white capitalize">{scanResult.id_type}</span>
+                    </div>
+                    <div className="flex items-center gap-3 mb-3">
+                      <Clock className="w-5 h-5 text-green-400" />
+                      <span className="text-sm text-white capitalize">{scanResult.log_type}</span>
+                    </div>
+                    <div className="text-xs text-green-300 mb-1">Timestamp</div>
+                    <div className="text-sm text-white font-mono mb-3">{scanResult.timestamp}</div>
+                    <div className="flex items-center gap-3 mb-3">
+                      <MapPin className="w-5 h-5 text-green-400" />
+                      <span className="text-sm text-white">{scanResult.section || 'Main Library'}</span>
+                    </div>
+                    <div className="text-xs text-green-300 mb-1">Purpose</div>
+                    <div className="text-sm text-white">{scanResult.purpose}</div>
+                    {scanResult.idempotent && (
+                      <div className="mt-3 text-xs text-yellow-300">Duplicate scan — result from previous record.</div>
+                    )}
+                  </div>
+                  <p className="text-green-400 font-semibold mt-4 text-center px-2">
+                    {scanResult.log_type === 'entry' ? 'Time-in recorded' : 'Time-out recorded'}
+                  </p>
                 </div>
               )}
 
               {/* Error State */}
               {!showScanner && scanStatus === 'error' && (
-                <div className="absolute inset-0 flex flex-col items-center justify-center bg-red-900 bg-opacity-20">
-                  <XCircle className="w-16 h-16 sm:w-20 sm:h-20 text-red-400 mb-3 sm:mb-4" />
-                  <p className="text-red-400 font-semibold text-base sm:text-lg text-center px-2">{message}</p>
+                <div className="absolute inset-0 flex flex-col items-center justify-center bg-red-900 bg-opacity-20 p-4">
+                  <XCircle className="w-16 h-16 sm:w-20 sm:h-20 text-red-400 mb-4" />
+                  <p className="text-red-400 font-semibold text-base sm:text-lg text-center px-2 mb-4">{message}</p>
+                  <button
+                    onClick={resetScanner}
+                    className="bg-red-500/20 hover:bg-red-500/30 border border-red-500 text-red-400 px-4 py-2 rounded-lg text-sm transition-colors"
+                  >
+                    Scan Again
+                  </button>
                 </div>
               )}
             </div>
@@ -278,7 +308,7 @@ export function QRScanScreen({ isOnline }: QRScanScreenProps) {
               <div className="mt-3 sm:mt-4 bg-yellow-500 bg-opacity-20 border border-yellow-500 rounded-lg p-3">
                 <p className="text-yellow-400 text-xs sm:text-sm text-center">
                   <WifiOff className="w-3 h-3 sm:w-4 sm:h-4 inline mr-2" />
-                  Offline mode: Data will sync when connection is restored
+                  Offline mode: QR scanning requires backend connection
                 </p>
               </div>
             )}
@@ -292,7 +322,7 @@ export function QRScanScreen({ isOnline }: QRScanScreenProps) {
                 className="inline-flex items-center space-x-2 bg-yellow-500 hover:bg-yellow-600 text-gray-900 font-medium py-2 px-6 rounded-lg"
               >
                 <RefreshCw className="w-4 h-4" />
-                <span>Scan Next</span>
+                <span>Scan Next Patron</span>
               </button>
             )}
             <p className="text-gray-500 text-xs sm:text-sm">Having trouble scanning?</p>
