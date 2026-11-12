@@ -255,7 +255,7 @@ router.get('/', authenticateToken, async (req, res) => {
   }
 });
 
-router.get('/analytics', authenticateToken, async (req, res) => {
+router.get('/analytics', authenticateToken, requireRole('librarian', 'administrator'), async (req, res) => {
   try {
     const { period = 'week', section, room_id } = req.query;
 
@@ -687,10 +687,12 @@ router.post('/scan',
         const resolvedUserId = patron.id;
 
         // Check active session: most recent entry without a subsequent exit
+        // Use id (auto-increment) for deterministic ordering, not timestamp,
+        // because multiple scans in the same second share the same timestamp.
         const [latestEntry] = await connection.query(
           `SELECT id, timestamp FROM visit_logs
            WHERE user_id = ? AND log_type = 'entry'
-           ORDER BY timestamp DESC, id DESC
+           ORDER BY id DESC
            LIMIT 1`,
           [resolvedUserId]
         );
@@ -698,15 +700,15 @@ router.post('/scan',
         let logType = 'entry';
 
         if (latestEntry.length > 0) {
-          const entryTimestamp = latestEntry[0].timestamp;
+          const entryId = latestEntry[0].id;
 
-          // Check if there's a subsequent exit after this entry
+          // Check if there's a subsequent exit after this entry using id ordering
           const [subsequentExit] = await connection.query(
             `SELECT id FROM visit_logs
-             WHERE user_id = ? AND log_type = 'exit' AND timestamp > ?
-             ORDER BY timestamp ASC, id ASC
+             WHERE user_id = ? AND log_type = 'exit' AND id > ?
+             ORDER BY id ASC
              LIMIT 1`,
-            [resolvedUserId, entryTimestamp]
+            [resolvedUserId, entryId]
           );
 
           if (subsequentExit.length === 0) {
@@ -734,28 +736,51 @@ router.post('/scan',
 
         await connection.commit();
 
-        const [newLog] = await connection.query(
-          'SELECT id, user_id, user_type, name, purpose, section, room_id, log_type, timestamp, client_event_id FROM visit_logs WHERE id = ?',
-          [result.insertId]
-        );
+        // Read committed record for response (read failures should not invalidate the commit)
+        let newLog;
+        try {
+          const [newLogRows] = await connection.query(
+            'SELECT id, user_id, user_type, name, purpose, section, room_id, log_type, timestamp, client_event_id FROM visit_logs WHERE id = ?',
+            [result.insertId]
+          );
+          newLog = newLogRows[0];
+        } catch (readError) {
+          // Post-commit read failed — data is still committed. Return minimal result.
+          console.error('Post-commit read failed:', readError.message);
+          newLog = {
+            id: result.insertId,
+            user_id: resolvedUserId,
+            log_type: logType,
+            client_event_id: client_event_id,
+            purpose: purpose || 'General',
+            section: section || 'Main Library',
+            room_id: room_id || null,
+            timestamp: null
+          };
+        }
 
-        broadcastNewLog(newLog[0]);
+        // Broadcast failure should not invalidate the committed attendance record
+        try {
+          broadcastNewLog(newLog);
+        } catch (broadcastError) {
+          console.error('Broadcast failed:', broadcastError.message);
+        }
 
         return res.status(201).json({
           success: true,
           data: {
-            id: newLog[0].id,
-            user_id: newLog[0].user_id,
+            id: newLog.id,
+            user_id: newLog.user_id,
             official_id: patron.official_id,
             id_type: patron.id_classification,
-            name: newLog[0].name,
-            user_type: newLog[0].user_type,
-            purpose: newLog[0].purpose,
-            section: newLog[0].section,
-            room_id: newLog[0].room_id,
-            log_type: newLog[0].log_type,
-            timestamp: newLog[0].timestamp,
-            client_event_id: newLog[0].client_event_id,
+            name: newLog.name,
+            user_type: newLog.user_type,
+            purpose: newLog.purpose,
+            section: newLog.section,
+            room_id: newLog.room_id,
+            log_type: newLog.log_type,
+            timestamp: newLog.timestamp,
+            client_event_id: newLog.client_event_id,
             idempotent: false
           },
           message: `Attendance recorded as ${logType}.`
@@ -765,31 +790,44 @@ router.post('/scan',
         if (error.code === 'ER_DUP_ENTRY' && error.message.includes('client_event_id')) {
           // Another request already committed this event_id — retrieve it
           const [existing] = await connection.query(
-            'SELECT id, user_id, log_type, timestamp, section, room_id FROM visit_logs WHERE client_event_id = ?',
+            'SELECT id, user_id, log_type, timestamp, section, room_id, purpose FROM visit_logs WHERE client_event_id = ?',
             [client_event_id]
           );
 
           await connection.rollback();
           if (existing.length > 0) {
+            // Check if the conflicting request has different data
+            const existingData = existing[0];
+            const isConflict =
+              existingData.purpose !== (purpose || 'General') ||
+              existingData.section !== (section || 'Main Library');
+
+            if (isConflict) {
+              return res.status(409).json({
+                success: false,
+                error: 'Event ID conflict',
+                message: `Client event ID "${client_event_id}" was already used with different attendance data. Original event: purpose="${existingData.purpose}", section="${existingData.section}".`
+              });
+            }
+
             return res.status(200).json({
               success: true,
               data: {
-                id: existing[0].id,
-                user_id: existing[0].user_id,
-                log_type: existing[0].log_type,
-                timestamp: existing[0].timestamp,
-                section: existing[0].section,
-                room_id: existing[0].room_id,
+                id: existingData.id,
+                user_id: existingData.user_id,
+                log_type: existingData.log_type,
+                timestamp: existingData.timestamp,
+                section: existingData.section,
+                room_id: existingData.room_id,
                 idempotent: true
               },
               message: 'Attendance event already recorded.'
             });
           }
-          return res.status(200).json({
-            success: true,
-            data: null,
-            idempotent: true,
-            message: 'Attendance event already recorded.'
+          return res.status(409).json({
+            success: false,
+            error: 'Event ID conflict',
+            message: `Client event ID "${client_event_id}" exists but original record could not be retrieved.`
           });
         }
 

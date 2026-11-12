@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { query, validationResult } = require('express-validator');
 const { promisePool } = require('../config/database');
-const { authenticateToken } = require('../middleware/auth');
+const { authenticateToken, requireRole } = require('../middleware/auth');
 
 const getAnalytics = async (req, res) => {
   try {
@@ -130,10 +130,10 @@ const getEngagementAnalytics = async (req, res) => {
   }
 };
 
-router.get('/analytics', authenticateToken, getAnalytics);
-router.get('/analytics/historical', authenticateToken, getHistoricalAnalytics);
-router.get('/analytics/trends', authenticateToken, getTrendAnalytics);
-router.get('/analytics/capacity', authenticateToken, getCapacityAnalytics);
-router.get('/analytics/engagement', authenticateToken, getEngagementAnalytics);
+router.get('/analytics', authenticateToken, requireRole('librarian', 'administrator'), getAnalytics);
+router.get('/analytics/historical', authenticateToken, requireRole('librarian', 'administrator'), getHistoricalAnalytics);
+router.get('/analytics/trends', authenticateToken, requireRole('librarian', 'administrator'), getTrendAnalytics);
+router.get('/analytics/capacity', authenticateToken, requireRole('librarian', 'administrator'), getCapacityAnalytics);
+router.get('/analytics/engagement', authenticateToken, requireRole('librarian', 'administrator'), getEngagementAnalytics);
 
 module.exports = router;
