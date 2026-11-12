@@ -1,0 +1,15 @@
+node_modules/
+dist/
+build/
+.env
+.env.local
+.env.production
+*.log
+*.sql
+.DS_Store
+Thumbs.db
+.vscode/
+.kilo/
+qr_codes/
+*.pem
+*.key
