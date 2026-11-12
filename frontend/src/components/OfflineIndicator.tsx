@@ -1,9 +1,10 @@
 import React, { useState, useEffect } from 'react';
 import { WifiOff, Wifi, AlertCircle, X, RefreshCw, CheckCircle, Loader } from 'lucide-react';
+import { getOfflineScanStats, syncOfflineScans, checkHealth } from '../utils/api';
 
 interface OfflineIndicatorProps {
   isOnline: boolean;
-  queuedCount: number;
+  queuedCount?: number;
   isSyncing?: boolean;
   syncProgress?: number;
   lastSyncTime?: Date | null;
@@ -12,7 +13,7 @@ interface OfflineIndicatorProps {
 
 export function OfflineIndicator({ 
   isOnline, 
-  queuedCount, 
+  queuedCount: propQueuedCount, 
   isSyncing = false, 
   syncProgress = 0,
   lastSyncTime,
@@ -20,6 +21,28 @@ export function OfflineIndicator({
 }: OfflineIndicatorProps) {
   const [isExpanded, setIsExpanded] = useState(false);
   const [showSyncComplete, setShowSyncComplete] = useState(false);
+  const [stats, setStats] = useState<any>(null);
+  const [statsLoading, setStatsLoading] = useState(false);
+
+  // Load stats when component mounts or when online status changes
+  useEffect(() => {
+    loadStats();
+  }, [isOnline]);
+
+  async function loadStats() {
+    if (!isIndexedDBAvailable()) return;
+    setStatsLoading(true);
+    try {
+      const result = await getOfflineScanStats();
+      if (result.success) {
+        setStats(result.data);
+      }
+    } catch (error) {
+      console.error('Failed to load offline stats:', error);
+    } finally {
+      setStatsLoading(false);
+    }
+  }
 
   // Auto-expand when syncing
   useEffect(() => {
@@ -30,15 +53,15 @@ export function OfflineIndicator({
 
   // Show sync complete animation
   useEffect(() => {
-    if (!isSyncing && queuedCount === 0 && lastSyncTime) {
+    if (!isSyncing && !propQueuedCount && lastSyncTime) {
       setShowSyncComplete(true);
       const timer = setTimeout(() => setShowSyncComplete(false), 3000);
       return () => clearTimeout(timer);
     }
-  }, [isSyncing, queuedCount, lastSyncTime]);
+  }, [isSyncing, propQueuedCount, lastSyncTime]);
 
   // Don't show anything if online and no queued items (unless recently synced)
-  if (isOnline && queuedCount === 0 && !showSyncComplete) return null;
+  if (isOnline && !propQueuedCount && !showSyncComplete && !statsLoading) return null;
 
   // Determine status for styling
   const getStatusConfig = () => {
@@ -69,13 +92,22 @@ export function OfflineIndicator({
         statusText: 'Data will sync when online'
       };
     }
-    if (queuedCount > 0) {
+    if (propQueuedCount > 0 || stats?.pending > 0) {
       return {
         bgColor: 'bg-orange-500',
         textColor: 'text-white',
         icon: <RefreshCw className="w-4 h-4" />,
         status: 'Pending',
-        statusText: `${queuedCount} item${queuedCount > 1 ? 's' : ''} waiting to sync`
+        statusText: `${propQueuedCount || stats?.pending || 0} item${propQueuedCount || stats?.pending > 1 ? 's' : ''} waiting to sync`
+      };
+    }
+    if (stats?.failed > 0 || stats?.needs_review > 0) {
+      return {
+        bgColor: 'bg-red-500',
+        textColor: 'text-white',
+        icon: <AlertCircle className="w-4 h-4" />,
+        status: 'Attention Needed',
+        statusText: `${stats.failed || 0} failed, ${stats.needs_review || 0} need review`
       };
     }
     return {
@@ -88,6 +120,21 @@ export function OfflineIndicator({
   };
 
   const config = getStatusConfig();
+
+  const handleSync = async () => {
+    if (!onManualSync) return;
+    setStatsLoading(true);
+    try {
+      const result = await syncOfflineScans();
+      if (result.success) {
+        setStats(result.data);
+      }
+    } catch (error) {
+      console.error('Sync failed:', error);
+    } finally {
+      setStatsLoading(false);
+    }
+  };
 
   return (
     <>
@@ -107,9 +154,9 @@ export function OfflineIndicator({
           <span className="text-sm font-medium">
             {config.status}
           </span>
-          {(queuedCount > 0 || isSyncing) && (
+          {(propQueuedCount || stats?.pending || stats?.failed || stats?.needs_review || isSyncing) && (
             <span className="bg-white bg-opacity-30 px-2 py-0.5 rounded-full text-xs font-bold">
-              {isSyncing ? `${syncProgress}%` : queuedCount}
+              {isSyncing ? `${syncProgress}%` : propQueuedCount || stats?.pending || stats?.failed || stats?.needs_review || 0}
             </span>
           )}
         </button>
@@ -141,7 +188,7 @@ export function OfflineIndicator({
               </div>
               <button
                 onClick={() => setIsExpanded(false)}
-                disabled={isSyncing}
+                disabled={isSyncing || statsLoading}
                 className="text-gray-400 hover:text-gray-600 disabled:opacity-50"
               >
                 <X className="w-5 h-5" />
@@ -164,6 +211,32 @@ export function OfflineIndicator({
               </div>
             )}
 
+            {/* Stats Summary */}
+            {(propQueuedCount || stats?.pending || stats?.failed || stats?.needs_review || stats?.synced) && (
+              <div className="grid grid-cols-2 gap-3 mb-4">
+                <div className="bg-blue-50 rounded-lg p-3">
+                  <p className="text-xs text-blue-900 font-semibold">Synced</p>
+                  <p className="text-lg font-bold text-blue-700">{stats?.synced || propQueuedCount}</p>
+                </div>
+                <div className="bg-green-50 rounded-lg p-3">
+                  <p className="text-xs text-green-900 font-semibold">Pending</p>
+                  <p className="text-lg font-bold text-green-700">{propQueuedCount || stats?.pending || 0}</p>
+                </div>
+                {stats?.failed > 0 && (
+                  <div className="bg-red-50 rounded-lg p-3">
+                    <p className="text-xs text-red-900 font-semibold">Failed</p>
+                    <p className="text-lg font-bold text-red-700">{stats.failed}</p>
+                  </div>
+                )}
+                {stats?.needs_review > 0 && (
+                  <div className="bg-orange-50 rounded-lg p-3">
+                    <p className="text-xs text-orange-900 font-semibold">Review</p>
+                    <p className="text-lg font-bold text-orange-700">{stats.needs_review}</p>
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* Status Messages */}
             <div className="space-y-3">
               {/* Offline Notice */}
@@ -176,7 +249,7 @@ export function OfflineIndicator({
                         You're currently offline
                       </p>
                       <p className="text-xs text-yellow-700 mt-1">
-                        Don't worry! Your {queuedCount} log{queuedCount > 1 ? 's' : ''} {queuedCount > 1 ? 'are' : 'is'} saved locally and will sync automatically when your connection returns.
+                        Don't worry! Your {propQueuedCount || stats?.pending || 0} log{propQueuedCount || stats?.pending > 1 ? 's' : ''} {propQueuedCount || stats?.pending > 1 ? 'are' : 'is'} saved locally and will sync automatically when your connection returns.
                       </p>
                     </div>
                   </div>
@@ -184,14 +257,14 @@ export function OfflineIndicator({
               )}
 
               {/* Queued Items */}
-              {queuedCount > 0 && !isSyncing && (
+              {(propQueuedCount > 0 || stats?.pending > 0) && !isSyncing && (
                 <div className="bg-orange-50 border border-orange-200 rounded-lg p-3">
                   <div className="flex items-center justify-between mb-2">
                     <p className="text-sm font-medium text-orange-900">
                       Pending Sync
                     </p>
                     <span className="bg-orange-200 text-orange-800 px-2 py-0.5 rounded-full text-xs font-bold">
-                      {queuedCount}
+                      {propQueuedCount || stats?.pending}
                     </span>
                   </div>
                   <p className="text-xs text-orange-700">
@@ -202,7 +275,7 @@ export function OfflineIndicator({
                   </p>
                   {isOnline && onManualSync && (
                     <button
-                      onClick={onManualSync}
+                      onClick={handleSync}
                       className="mt-2 w-full bg-orange-500 hover:bg-orange-600 text-white text-sm font-medium py-2 px-4 rounded-lg transition-colors flex items-center justify-center space-x-2"
                     >
                       <RefreshCw className="w-4 h-4" />
@@ -222,7 +295,7 @@ export function OfflineIndicator({
                         Syncing your data
                       </p>
                       <p className="text-xs text-blue-700 mt-1">
-                        Please keep this page open while we synchronize your {queuedCount} log{queuedCount > 1 ? 's' : ''}.
+                        Please keep this page open while we synchronize your {propQueuedCount || stats?.pending || 0} log{propQueuedCount || stats?.pending > 1 ? 's' : ''}.
                       </p>
                     </div>
                   </div>
@@ -258,7 +331,7 @@ export function OfflineIndicator({
             <div className="mt-4 sm:hidden">
               <button
                 onClick={() => setIsExpanded(false)}
-                disabled={isSyncing}
+                disabled={isSyncing || statsLoading}
                 className="w-full bg-gray-100 hover:bg-gray-200 text-gray-700 font-medium py-2 px-4 rounded-lg transition-colors disabled:opacity-50"
               >
                 {isSyncing ? 'Syncing...' : 'Close'}

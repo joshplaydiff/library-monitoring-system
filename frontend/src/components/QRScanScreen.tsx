@@ -1,9 +1,9 @@
-import React, { useState, useRef, useCallback } from 'react';
+import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { QrCode, ArrowLeft, CheckCircle, XCircle, Wifi, WifiOff, RefreshCw, User, Clock, MapPin, FileText, Menu, Plus } from 'lucide-react';
+import { QrCode, ArrowLeft, CheckCircle, XCircle, Wifi, WifiOff, RefreshCw, User, Clock, MapPin, FileText, Menu, Plus, RefreshCw as RefreshIcon } from 'lucide-react';
 import { Scanner } from '@yudiel/react-qr-scanner';
 import { AppFooter } from './AppFooter';
-import { scanAttendance } from '../utils/api';
+import { scanAttendance, saveOfflineScan, getOfflineScanStats, syncOfflineScans, checkHealth } from '../utils/api';
 
 interface QRScanScreenProps {
   isOnline: boolean;
@@ -23,6 +23,14 @@ interface ScanResult {
   timestamp: string;
   client_event_id: string | null;
   idempotent: boolean;
+}
+
+// Local roster entry for offline scanning
+interface LocalRosterEntry {
+  official_id: string;
+  id_type: string;
+  full_name: string;
+  user_type: string;
 }
 
 const PURPOSES = [
@@ -50,6 +58,8 @@ export function QRScanScreen({ isOnline }: QRScanScreenProps) {
   const [scanResult, setScanResult] = useState<ScanResult | null>(null);
   const [selectedPurpose, setSelectedPurpose] = useState('General');
   const [selectedSection, setSelectedSection] = useState('Main Library');
+  const [offlineMode, setOfflineMode] = useState(false);
+  const [localRoster, setLocalRoster] = useState<LocalRosterEntry[]>([]);
   const lastScannedValue = useRef<string | null>(null);
   const lastScanTime = useRef<number>(0);
   const pendingScan = useRef<{ rawValue: string; timestamp: number; clientEventId: string } | null>(null);
@@ -58,6 +68,9 @@ export function QRScanScreen({ isOnline }: QRScanScreenProps) {
   const generateClientEventId = useCallback(() => {
     return 'evt_' + Date.now() + '_' + Math.random().toString(36).substring(2, 11);
   }, []);
+
+  // Check if we should operate in offline mode
+  const isOffline = !isOnline;
 
   const handleScan = async (detectedCodes: any[]) => {
     // Prevent processing while a scan is already in flight
@@ -123,36 +136,94 @@ export function QRScanScreen({ isOnline }: QRScanScreenProps) {
         return;
       }
 
-      // Call server-authoritative scan endpoint
-      // The backend resolves the patron, checks session state, and records entry/exit
-      const scanResult = await scanAttendance({
-        client_event_id: pendingScan.current.clientEventId,
-        official_id: officialId,
-        id_type: idType,
-        purpose: selectedPurpose,
-        section: selectedSection,
-        room_id: null
-      });
+      // Check local roster for offline verification
+      const localPatron = localRoster.find(
+        (p: LocalRosterEntry) => p.official_id === officialId && p.id_type === idType
+      );
 
-      // Clear the pending scan marker
-      pendingScan.current = null;
+      if (isOffline) {
+        // Offline mode: save to IndexedDB, mark as provisional
+        if (!localPatron) {
+          setScanStatus('error');
+          setMessage(`Patron ${officialId} (${idType}) not found in local roster. Cannot verify offline.`);
+          setProcessing(false);
+          setShowScanner(true);
+          lastScannedValue.current = null;
+          lastScanTime.current = 0;
+          pendingScan.current = null;
+          return;
+        }
 
-      if (scanResult.success && scanResult.data) {
-        const data = scanResult.data as ScanResult;
-        setScanResult(data);
-        setScanStatus('success');
+        // Save offline event
+        const offlineResult = await saveOfflineScan({
+          client_event_id: pendingScan.current.clientEventId,
+          official_id: officialId,
+          id_type: idType,
+          purpose: selectedPurpose,
+          section: selectedSection,
+          room_id: null,
+          log_type: 'entry' // Default to entry for offline; will be reconciled on sync
+        });
 
-        const action = data.log_type === 'entry' ? 'Time-in' : 'Time-out';
-        setMessage(`${action} recorded for ${data.name} (${data.official_id})`);
+        pendingScan.current = null;
+
+        if (offlineResult.success) {
+          setScanResult({
+            id: -1, // Temporary ID, will be replaced on sync
+            user_id: null,
+            official_id: officialId,
+            id_type: idType,
+            name: localPatron.full_name,
+            user_type: localPatron.user_type,
+            purpose: selectedPurpose,
+            section: selectedSection,
+            room_id: null,
+            log_type: 'entry',
+            timestamp: new Date().toISOString(),
+            client_event_id: pendingScan.current!.clientEventId,
+            idempotent: false
+          });
+          setScanStatus('success');
+          setMessage(`OFFLINE: ${localPatron.full_name} (${officialId}) - ${selectedPurpose} at ${selectedSection}. Will sync when online.`);
+        } else {
+          setScanStatus('error');
+          setMessage(offlineResult.error || 'Failed to save offline attendance');
+          lastScannedValue.current = null;
+          lastScanTime.current = 0;
+          setProcessing(false);
+          setShowScanner(true);
+        }
       } else {
-        // Server did not confirm persistence — do not show success
-        setScanStatus('error');
-        setMessage(scanResult.error || 'Failed to record attendance. Please try again.');
-        // Reset debounce on failure so the user can retry
-        lastScannedValue.current = null;
-        lastScanTime.current = 0;
-        setProcessing(false);
-        setShowScanner(true);
+        // Online mode: call server-authoritative scan endpoint
+        const scanResult = await scanAttendance({
+          client_event_id: pendingScan.current.clientEventId,
+          official_id: officialId,
+          id_type: idType,
+          purpose: selectedPurpose,
+          section: selectedSection,
+          room_id: null
+        });
+
+        // Clear the pending scan marker
+        pendingScan.current = null;
+
+        if (scanResult.success && scanResult.data) {
+          const data = scanResult.data as ScanResult;
+          setScanResult(data);
+          setScanStatus('success');
+
+          const action = data.log_type === 'entry' ? 'Time-in' : 'Time-out';
+          setMessage(`${action} recorded for ${data.name} (${data.official_id})`);
+        } else {
+          // Server did not confirm persistence — do not show success
+          setScanStatus('error');
+          setMessage(scanResult.error || 'Failed to record attendance. Please try again.');
+          // Reset debounce on failure so the user can retry
+          lastScannedValue.current = null;
+          lastScanTime.current = 0;
+          setProcessing(false);
+          setShowScanner(true);
+        }
       }
     } catch (error) {
       pendingScan.current = null;
@@ -202,6 +273,35 @@ export function QRScanScreen({ isOnline }: QRScanScreenProps) {
     navigate('/admin/visit-logs');
   };
 
+  // Load local roster from localStorage (set by librarian when online)
+  useEffect(() => {
+    const stored = localStorage.getItem('local_roster');
+    if (stored) {
+      try {
+        setLocalRoster(JSON.parse(stored));
+      } catch {
+        setLocalRoster([]);
+      }
+    } else {
+      setLocalRoster([]);
+    }
+  }, []);
+
+  // Handle offline/online changes
+  useEffect(() => {
+    if (!isOnline) {
+      setOfflineMode(true);
+    } else {
+      setOfflineMode(false);
+      // Auto-sync offline events when coming back online
+      syncOfflineScans().then(result => {
+        if (result.success) {
+          setMessage(`Synced ${result.data?.synced_count || 0} offline events`);
+        }
+      });
+    }
+  }, [isOnline]);
+
   return (
     <div className="min-h-screen bg-gray-900 flex flex-col">
       {/* Header */}
@@ -224,7 +324,7 @@ export function QRScanScreen({ isOnline }: QRScanScreenProps) {
               ) : (
                 <>
                   <WifiOff className="w-4 h-4 sm:w-5 sm:h-5 text-yellow-400" />
-                  <span className="text-xs sm:text-sm text-yellow-400">Offline</span>
+                  <span className="text-xs sm:text-sm text-yellow-400">Offline Mode</span>
                 </>
               )}
             </div>
@@ -280,6 +380,28 @@ export function QRScanScreen({ isOnline }: QRScanScreenProps) {
               </div>
             </div>
           </div>
+
+          {/* Local Roster (Offline Mode) */}
+          {isOffline && localRoster.length > 0 && (
+            <div className="bg-blue-50 rounded-xl p-4 border border-blue-200">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-xs font-medium text-blue-900 uppercase">Local Roster</span>
+                <span className="text-xs text-blue-600">{localRoster.length} patrons</span>
+              </div>
+              <div className="overflow-y-auto max-h-32 space-y-1">
+                {localRoster.map((p) => (
+                  <div key={`${p.official_id}-${p.id_type}`} className="text-sm">
+                    <span className="font-medium text-gray-900">{p.full_name}</span>
+                    <span className="ml-2 text-xs font-mono text-gray-500">{p.official_id}</span>
+                    <span className="ml-2 text-xs text-blue-500 capitalize">{p.id_type}</span>
+                  </div>
+                ))}
+              </div>
+              <p className="text-xs text-gray-500 mt-2">
+                Scan a patron's QR code to verify against local roster and record attendance offline.
+              </p>
+            </div>
+          )}
 
           {/* Scanner Frame */}
           <div className="relative bg-gray-800 rounded-2xl p-4 sm:p-6 shadow-2xl">
@@ -364,7 +486,7 @@ export function QRScanScreen({ isOnline }: QRScanScreenProps) {
               <div className="mt-3 sm:mt-4 bg-yellow-500 bg-opacity-20 border border-yellow-500 rounded-lg p-3">
                 <p className="text-yellow-400 text-xs sm:text-sm text-center">
                   <WifiOff className="w-3 h-3 sm:w-4 sm:h-4 inline mr-2" />
-                  Offline mode: QR scanning requires backend connection
+                  Offline mode: QR scanning saves locally. Events sync when connection returns.
                 </p>
               </div>
             )}

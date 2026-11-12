@@ -199,8 +199,12 @@ async function main() {
     // Step 9: Test client_event_id uniqueness
     console.log('Step 9: Test client_event_id uniqueness');
     await promiseConn.query(
+      `INSERT IGNORE INTO test_users (student_id, full_name, email, user_type, department) VALUES 
+       ('STU-UNIQUE', 'Unique User', 'unique@test.com', 'student', 'Computer Science')`
+    );
+    await promiseConn.query(
       `INSERT INTO test_visit_logs (user_id, user_type, name, purpose, section, room_id, log_type, timestamp, client_event_id, synced) 
-       VALUES (1, 'student', 'Alice Student', 'General', 'Main Library', NULL, 'entry', NOW(), 'evt_test_001', 1)`
+       VALUES (1, 'student', 'Unique User', 'General', 'Main Library', NULL, 'entry', NOW(), 'evt_test_001', 1)`
     );
     try {
       await promiseConn.query(

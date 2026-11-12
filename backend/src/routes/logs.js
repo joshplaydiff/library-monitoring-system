@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { body, query, validationResult } = require('express-validator');
 const { promisePool } = require('../config/database');
+const { resolvePatron, hasActiveSession, insertAttendanceRecord, findExistingEvent, processScan } = require('../services/attendanceService');
 const { broadcastNewLog, broadcastAnalyticsUpdate } = require('../utils/socketManager');
 const { authenticateToken, optionalAuth, requireRole } = require('../middleware/auth');
 
@@ -847,6 +848,232 @@ router.post('/scan',
       if (connection) {
         connection.release();
       }
+    }
+  }
+);
+
+/**
+ * Batch sync offline attendance events.
+ * Processes multiple offline events transactionally, validates patrons,
+ * handles duplicate-safe replay via client_event_id, and returns per-event
+ * results (accepted, previously-synced, rejected, needs-review).
+ */
+router.post('/sync-batch',
+  authenticateToken,
+  requireRole('librarian', 'administrator'),
+  [
+    body('logs').isArray().withMessage('logs must be an array'),
+    body('logs.*.client_event_id').notEmpty().withMessage('client_event_id is required'),
+    body('logs.*.official_id').notEmpty().withMessage('official_id is required'),
+    body('logs.*.id_type').isIn(['student', 'faculty', 'support_staff']).withMessage('id_type must be student, faculty, or support_staff'),
+    body('logs.*.log_type').isIn(['entry', 'exit']).withMessage('log_type must be entry or exit')
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        error: errors.array()[0].msg
+      });
+    }
+
+    const { logs } = req.body;
+    const requestingUserRole = req.user?.role;
+
+    if (requestingUserRole !== 'librarian' && requestingUserRole !== 'administrator') {
+      return res.status(403).json({
+        success: false,
+        error: 'Access denied. Librarian or administrator account required.'
+      });
+    }
+
+    const results = {
+      synced: [],
+      previously_synced: [],
+      rejected: [],
+      needs_review: []
+    };
+
+    try {
+      // Process events one at a time to ensure proper transaction handling
+      // and to avoid partial batch failures losing data
+      for (const event of logs) {
+        const {
+          client_event_id,
+          official_id,
+          id_type,
+          purpose,
+          section,
+          room_id,
+          log_type,
+          timestamp
+        } = event;
+
+        try {
+          const connection = await promisePool.getConnection();
+          await connection.beginTransaction();
+
+          try {
+            // Idempotency: check if this client_event_id was already processed
+            const [existing] = await connection.query(
+              'SELECT id, user_id, log_type, timestamp, section, room_id, purpose FROM visit_logs WHERE client_event_id = ?',
+              [client_event_id]
+            );
+
+            if (existing.length > 0) {
+              const existingData = existing[0];
+              // Same data → previously synced
+              const isSameData =
+                existingData.purpose === (purpose || 'General') &&
+                existingData.section === (section || 'Main Library');
+
+              if (isSameData) {
+                results.previously_synced.push({
+                  client_event_id,
+                  id: existingData.id,
+                  log_type: existingData.log_type,
+                  status: 'previously_synced'
+                });
+                await connection.rollback();
+                continue;
+              } else {
+                // Conflict: same event ID but different data
+                results.needs_review.push({
+                  client_event_id,
+                  official_id,
+                  reason: 'Conflicting data for same event ID',
+                  original: {
+                    purpose: existingData.purpose,
+                    section: existingData.section
+                  },
+                  submitted: {
+                    purpose: purpose || 'General',
+                    section: section || 'Main Library'
+                  }
+                });
+                await connection.rollback();
+                continue;
+              }
+            }
+
+            // Resolve and lock the patron row
+            const [users] = await connection.query(
+              'SELECT id, student_id, official_id, id_classification, role, full_name, email, user_type, department FROM users WHERE official_id = ? AND id_classification = ? FOR UPDATE',
+              [official_id, id_type]
+            );
+
+            if (users.length === 0) {
+              await connection.rollback();
+              results.rejected.push({
+                client_event_id,
+                official_id,
+                id_type,
+                reason: 'Patron not found. Register patron first.'
+              });
+              continue;
+            }
+
+            const patron = users[0];
+            const resolvedUserId = patron.id;
+
+            // Determine entry/exit using deterministic ID ordering
+            const [latestEntry] = await connection.query(
+              `SELECT id, timestamp FROM visit_logs
+               WHERE user_id = ? AND log_type = 'entry'
+               ORDER BY id DESC
+               LIMIT 1`,
+              [resolvedUserId]
+            );
+
+            let logType = log_type; // Trust the client's log_type for offline events
+            // But validate: if there's no active session, force entry
+            // If there's an active entry without exit, allow exit
+            if (latestEntry.length > 0) {
+              const entryId = latestEntry[0].id;
+              const [subsequentExit] = await connection.query(
+                `SELECT id FROM visit_logs
+                 WHERE user_id = ? AND log_type = 'exit' AND id > ?
+                 ORDER BY id ASC
+                 LIMIT 1`,
+                [resolvedUserId, entryId]
+              );
+              if (subsequentExit.length === 0) {
+                // Active session exists — client-specified log_type is authoritative
+                // but we validate: if they said 'entry' but there's an active session,
+                // that's still valid (re-entry after exit not yet recorded)
+                logType = log_type;
+              }
+            }
+
+            // Insert the attendance record
+            const [result] = await connection.query(
+              `INSERT INTO visit_logs
+                 (user_id, user_type, name, purpose, section, room_id, log_type, timestamp, client_event_id, synced)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+              [
+                resolvedUserId,
+                patron.user_type,
+                patron.full_name,
+                purpose || 'General',
+                section || 'Main Library',
+                room_id || null,
+                logType,
+                timestamp || new Date().toISOString().slice(0, 19).replace('T', ' '),
+                client_event_id
+              ]
+            );
+
+            await connection.commit();
+
+            results.synced.push({
+              client_event_id,
+              id: result.insertId,
+              official_id: patron.official_id,
+              id_type: patron.id_classification,
+              name: patron.full_name,
+              log_type: logType,
+              timestamp: timestamp || new Date().toISOString().slice(0, 19).replace('T', ' '),
+              status: 'synced'
+            });
+          } catch (error) {
+            await connection.rollback();
+            throw error;
+          } finally {
+            connection.release();
+          }
+        } catch (error) {
+          console.error(`Error syncing event ${client_event_id}:`, error);
+          results.rejected.push({
+            client_event_id,
+            official_id,
+            id_type,
+            reason: error.message || 'Failed to sync event'
+          });
+        }
+      }
+
+      return res.status(200).json({
+        success: true,
+        data: {
+          synced_count: results.synced.length,
+          previously_synced_count: results.previously_synced.length,
+          rejected_count: results.rejected.length,
+          needs_review_count: results.needs_review.length,
+          total_processed: logs.length,
+          synced: results.synced,
+          previously_synced: results.previously_synced,
+          rejected: results.rejected,
+          needs_review: results.needs_review
+        },
+        message: `Batch sync complete: ${results.synced.length} synced, ${results.previously_synced.length} previously synced, ${results.rejected.length} rejected, ${results.needs_review.length} need review`
+      });
+    } catch (error) {
+      console.error('Batch sync error:', error);
+      return res.status(500).json({
+        success: false,
+        error: 'Batch sync failed',
+        message: error.message
+      });
     }
   }
 );

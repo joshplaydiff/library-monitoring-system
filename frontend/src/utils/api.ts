@@ -1,5 +1,7 @@
 const BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000/api';
 
+import { saveOfflineEvent, getOfflineEvents, getOfflineEvent, updateEventStatus, deleteSyncedEvent, getEventCounts, eventExists, isIndexedDBAvailable } from './idbStore';
+
 // Check if online before making requests
 function checkOnline(): boolean {
   if (!navigator.onLine) {
@@ -301,6 +303,222 @@ export async function scanAttendance(data: {
   }
 }
 
+// Save attendance event offline to IndexedDB
+export async function saveOfflineScan(data: {
+  client_event_id: string;
+  official_id: string;
+  id_type: string;
+  purpose?: string;
+  section?: string;
+  room_id?: number;
+  log_type: 'entry' | 'exit';
+}): Promise<ApiResponse<any>> {
+  if (!isIndexedDBAvailable()) {
+    return { success: false, error: 'IndexedDB is not available in this browser' };
+  }
+
+  try {
+    const event: any = {
+      client_event_id: data.client_event_id,
+      official_id: data.official_id,
+      id_type: data.id_type,
+      purpose: data.purpose || 'General',
+      section: data.section || 'Main Library',
+      room_id: data.room_id || null,
+      log_type: data.log_type,
+      local_timestamp: new Date().toISOString(),
+      sync_status: 'pending',
+      retry_count: 0
+    };
+
+    await saveOfflineEvent(event);
+    return { success: true, data: event, message: 'Attendance saved offline' };
+  } catch (error) {
+    console.error('Error saving offline scan:', error);
+    return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+  }
+}
+
+// Get all offline events with their sync status
+export async function getOfflineScanEvents(): Promise<ApiResponse<any[]>> {
+  if (!isIndexedDBAvailable()) {
+    return { success: false, error: 'IndexedDB is not available in this browser' };
+  }
+
+  try {
+    const events = await getOfflineEvents();
+    return { success: true, data: events };
+  } catch (error) {
+    console.error('Error fetching offline events:', error);
+    return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+  }
+}
+
+// Get offline event counts by status
+export async function getOfflineScanStats(): Promise<ApiResponse<any>> {
+  if (!isIndexedDBAvailable()) {
+    return { success: false, error: 'IndexedDB is not available in this browser' };
+  }
+
+  try {
+    const counts = await getEventCounts();
+    return { success: true, data: counts };
+  } catch (error) {
+    console.error('Error fetching offline stats:', error);
+    return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+  }
+}
+
+// Sync offline events to backend
+export async function syncOfflineScans(): Promise<ApiResponse<any>> {
+  if (!checkOnline()) {
+    return { success: false, error: 'No internet connection. Cannot sync.' };
+  }
+
+  if (!isIndexedDBAvailable()) {
+    return { success: false, error: 'IndexedDB is not available in this browser' };
+  }
+
+  try {
+    const token = localStorage.getItem('userToken');
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+
+    // Get all pending/failed events
+    const pendingEvents = await getOfflineEvents();
+    const eventsToSync = pendingEvents.filter(
+      (e: any) => e.sync_status === 'pending' || e.sync_status === 'failed'
+    );
+
+    if (eventsToSync.length === 0) {
+      return { success: true, data: [], message: 'No pending events to sync' };
+    }
+
+    // Process in batches
+    const BATCH_SIZE = 10;
+    const results: any[] = [];
+    let syncedCount = 0;
+    let failedCount = 0;
+    let needsReviewCount = 0;
+
+    for (let i = 0; i < eventsToSync.length; i += BATCH_SIZE) {
+      const batch = eventsToSync.slice(i, i + BATCH_SIZE);
+      const batchData = batch.map((e: any) => ({
+        client_event_id: e.client_event_id,
+        official_id: e.official_id,
+        id_type: e.id_type,
+        purpose: e.purpose,
+        section: e.section,
+        room_id: e.room_id,
+        log_type: e.log_type,
+        timestamp: e.local_timestamp
+      }));
+
+      const response = await fetch(`${BASE_URL}/logs/sync`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ logs: batchData })
+      });
+
+      const data = await safeJsonParse(response);
+
+      if (!response.ok) {
+        // Mark entire batch as failed if server error
+        for (const event of batch) {
+          await updateEventStatus(event.client_event_id, 'failed', data.error || 'Sync failed');
+          failedCount++;
+        }
+        continue;
+      }
+
+      // Process individual results
+      const resultsData = data.data || [];
+      const resultsMap = new Map();
+      for (const r of resultsData) {
+        resultsMap.set(r.client_event_id, r);
+      }
+
+      for (const event of batch) {
+        const result = resultsMap.get(event.client_event_id);
+        if (result) {
+          if (result.status === 'synced' || result.idempotent) {
+            await deleteSyncedEvent(event.client_event_id);
+            syncedCount++;
+          } else if (result.status === 'needs-review') {
+            await updateEventStatus(event.client_event_id, 'needs-review', result.error);
+            needsReviewCount++;
+          } else {
+            await updateEventStatus(event.client_event_id, 'failed', result.error);
+            failedCount++;
+          }
+        } else {
+          await updateEventStatus(event.client_event_id, 'failed', 'No result returned');
+          failedCount++;
+        }
+      }
+    }
+
+    return {
+      success: true,
+      data: {
+        synced_count: syncedCount,
+        failed_count: failedCount,
+        needs_review_count: needsReviewCount,
+        total_processed: eventsToSync.length
+      },
+      message: `Synced ${syncedCount} events, ${failedCount} failed, ${needsReviewCount} need review`
+    };
+  } catch (error) {
+    console.error('Error syncing offline scans:', error);
+    return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+  }
+}
+
+// Check actual server reachability (not just navigator.onLine)
+export async function checkHealth(): Promise<boolean> {
+  try {
+    const response = await fetch(`${BASE_URL}/health/health`, {
+      method: 'GET',
+      headers: { 'Content-Type': 'application/json' },
+      signal: AbortSignal.timeout(5000)
+    });
+    if (!response.ok) return false;
+    const data = await safeJsonParse(response);
+    return data.status === 'ok' || data.status === 'connected';
+  } catch (error) {
+    console.error('Health check failed:', error);
+    return false;
+  }
+}
+
+// Retry with exponential backoff
+export async function retryWithBackoff<T>(
+  fn: () => Promise<T>,
+  maxRetries: number = 3,
+  baseDelay: number = 1000
+): Promise<T> {
+  let lastError: Error | null = null;
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+      if (attempt < maxRetries - 1) {
+        const delay = baseDelay * Math.pow(2, attempt);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+  }
+  throw lastError || new Error('Retry failed after max attempts');
+}
+
+// Check if IndexedDB is available
+export function isIndexedDBAvailable(): boolean {
+  return typeof indexedDB !== 'undefined';
+}
+
 // Manual logout for a user
 export async function manualLogout(userId: string): Promise<ApiResponse<any>> {
   try {
@@ -346,18 +564,6 @@ export async function getUserById(userId: string): Promise<ApiResponse<any>> {
       success: false, 
       error: error instanceof Error ? error.message : 'Unknown error' 
     };
-  }
-}
-
-// Health check
-export async function checkHealth(): Promise<boolean> {
-  try {
-    const response = await fetch(`${BASE_URL}/health/health`);
-    const data = await safeJsonParse(response);
-    return data.status === 'ok';
-  } catch (error) {
-    console.error('Health check failed:', error);
-    return false;
   }
 }
 
